@@ -1,0 +1,43 @@
+{
+  "name": "polymarket-arbitrage-gabagool-fork",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "redeem": "tsx src/redeem.ts",
+    "redeem:holdings": "tsx src/redeem-holdings.ts",
+    "redeem:proxy": "tsx src/redeem-proxy.ts",
+    "test": "tsx --test src/test/limits.test.ts src/test/marketInterval.test.ts"
+  },
+  "keywords": [
+    "polymarket",
+    "prediction-market",
+    "gabagool"
+  ],
+  "author": "CrewSX Solutions",
+  "license": "ISC",
+  "description": "Polymarket Arbitrage Trading Bot, Forked from Gabagool22's Bot",
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "ts-node": "^10.9.2",
+    "tsx": "^4.19.4",
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "@ethersproject/abi": "^5.8.0",
+    "@ethersproject/bignumber": "^5.8.0",
+    "@ethersproject/bytes": "^5.8.0",
+    "@ethersproject/constants": "^5.8.0",
+    "@ethersproject/contracts": "^5.8.0",
+    "@ethersproject/providers": "^5.8.0",
+    "@ethersproject/units": "^5.8.0",
+    "@ethersproject/wallet": "^5.8.0",
+    "@polymarket/clob-client": "^5.8.1",
+    "@polymarket/real-time-data-client": "^1.4.0",
+    "@types/ws": "^8.18.1",
+    "chalk": "^5.6.2",
+    "dotenv": "^17.2.3",
+    "ethers": "^6.16.0",
+    "ws": "^8.19.0"
+  }
+}
