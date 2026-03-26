@@ -1,10 +1,7 @@
-import { readFileSync, writeFileSync, existsSync } from "fs";
+import * as fs from "fs";
 import { resolve } from "path";
 import { logger } from "./logger";
 
-/**
- * Holdings structure: market_id (conditionId) -> { token_id: amount }
- */
 export interface TokenHoldings {
     [marketId: string]: {
         [tokenId: string]: number;
@@ -13,124 +10,104 @@ export interface TokenHoldings {
 
 const HOLDINGS_FILE = resolve(process.cwd(), "src/data/token-holding.json");
 
-/**
- * Load holdings from file
- */
+// In-memory cache — avoids sync disk reads on every call
+let cache: TokenHoldings | null = null;
+let persistTimer: NodeJS.Timeout | null = null;
+let writeInFlight = false;
+
+function ensureCache(): TokenHoldings {
+    if (cache !== null) return cache;
+    if (!fs.existsSync(HOLDINGS_FILE)) {
+        cache = {};
+        return cache;
+    }
+    try {
+        cache = JSON.parse(fs.readFileSync(HOLDINGS_FILE, "utf-8")) as TokenHoldings;
+    } catch {
+        logger.error("Failed to load holdings — starting fresh");
+        cache = {};
+    }
+    return cache;
+}
+
+function schedulePersist(): void {
+    if (persistTimer) return;
+    persistTimer = setTimeout(async () => {
+        persistTimer = null;
+        if (writeInFlight || cache === null) return;
+        writeInFlight = true;
+        try {
+            const dir = resolve(HOLDINGS_FILE, "..");
+            await fs.promises.mkdir(dir, { recursive: true });
+            await fs.promises.writeFile(HOLDINGS_FILE, JSON.stringify(cache));
+        } catch (e) {
+            logger.error(`Failed to persist holdings: ${e instanceof Error ? e.message : String(e)}`);
+        } finally {
+            writeInFlight = false;
+        }
+    }, 300);
+}
+
 export function loadHoldings(): TokenHoldings {
-    if (!existsSync(HOLDINGS_FILE)) {
-        return {};
-    }
-
-    try {
-        const content = readFileSync(HOLDINGS_FILE, "utf-8");
-        return JSON.parse(content) as TokenHoldings;
-    } catch (error) {
-        logger.error("Failed to load holdings", error);
-        return {};
-    }
+    return ensureCache();
 }
 
-/**
- * Save holdings to file
- */
 export function saveHoldings(holdings: TokenHoldings): void {
-    try {
-        writeFileSync(HOLDINGS_FILE, JSON.stringify(holdings, null, 2));
-    } catch (error) {
-        logger.error("Failed to save holdings", error);
-    }
+    cache = holdings;
+    schedulePersist();
 }
 
-/**
- * Add tokens to holdings after a BUY order
- */
 export function addHoldings(marketId: string, tokenId: string, amount: number): void {
-    const holdings = loadHoldings();
-    
-    if (!holdings[marketId]) {
-        holdings[marketId] = {};
-    }
-    
-    if (!holdings[marketId][tokenId]) {
-        holdings[marketId][tokenId] = 0;
-    }
-    
-    holdings[marketId][tokenId] += amount;
-    
-    saveHoldings(holdings);
+    const holdings = ensureCache();
+    if (!holdings[marketId]) holdings[marketId] = {};
+    holdings[marketId][tokenId] = (holdings[marketId][tokenId] || 0) + amount;
+    schedulePersist();
     logger.info(`Added ${amount} tokens to holdings: ${marketId} -> ${tokenId}`);
 }
 
-/**
- * Get holdings for a specific token
- */
 export function getHoldings(marketId: string, tokenId: string): number {
-    const holdings = loadHoldings();
-    return holdings[marketId]?.[tokenId] || 0;
+    return ensureCache()[marketId]?.[tokenId] || 0;
 }
 
-/**
- * Remove tokens from holdings after a SELL order
- */
 export function removeHoldings(marketId: string, tokenId: string, amount: number): void {
-    const holdings = loadHoldings();
-    
+    const holdings = ensureCache();
     if (!holdings[marketId] || !holdings[marketId][tokenId]) {
         logger.error(`No holdings found for ${marketId} -> ${tokenId}`);
         return;
     }
-    
-    const currentAmount = holdings[marketId][tokenId];
-    const newAmount = Math.max(0, currentAmount - amount);
-    
-    if (newAmount === 0) {
+    const current = holdings[marketId][tokenId];
+    const remaining = Math.max(0, current - amount);
+    if (remaining === 0) {
         delete holdings[marketId][tokenId];
-        // Clean up empty market entries
-        if (Object.keys(holdings[marketId]).length === 0) {
-            delete holdings[marketId];
-        }
+        if (Object.keys(holdings[marketId]).length === 0) delete holdings[marketId];
     } else {
-        holdings[marketId][tokenId] = newAmount;
+        holdings[marketId][tokenId] = remaining;
     }
-    
-    saveHoldings(holdings);
-    logger.info(`Removed ${amount} tokens from holdings: ${marketId} -> ${tokenId} (remaining: ${newAmount})`);
+    schedulePersist();
+    logger.info(`Removed ${amount} tokens from holdings: ${marketId} -> ${tokenId} (remaining: ${remaining})`);
 }
 
-/**
- * Get all holdings for a market
- */
 export function getMarketHoldings(marketId: string): { [tokenId: string]: number } {
-    const holdings = loadHoldings();
-    return holdings[marketId] || {};
+    return ensureCache()[marketId] || {};
 }
 
-/**
- * Get all holdings (for debugging/viewing)
- */
 export function getAllHoldings(): TokenHoldings {
-    return loadHoldings();
+    return ensureCache();
 }
 
-/**
- * Clear all holdings for a specific market
- */
 export function clearMarketHoldings(marketId: string): void {
-    const holdings = loadHoldings();
+    const holdings = ensureCache();
     if (holdings[marketId]) {
         delete holdings[marketId];
-        saveHoldings(holdings);
+        schedulePersist();
         logger.info(`Cleared holdings for market: ${marketId}`);
     } else {
         logger.error(`No holdings found for market: ${marketId}`);
     }
 }
 
-/**
- * Clear all holdings (use with caution)
- */
 export function clearHoldings(): void {
-    saveHoldings({});
+    cache = {};
+    schedulePersist();
     logger.info("All holdings cleared");
 }
-
