@@ -360,6 +360,48 @@ export class AdaptivePricePredictor {
         };
     }
     
+    /**
+     * Calculate features at an arbitrary index `k` within the prices array (length >= k).
+     * Mirrors calculateFeatures exactly so learning trains the same feature space.
+     */
+    private calculateFeaturesAt(prices: number[], k: number): {
+        priceLag1: number;
+        priceLag2: number;
+        priceLag3: number;
+        momentum: number;
+        volatility: number;
+        trend: number;
+    } {
+        const currentPrice = prices[k - 1];
+        const priceLag1 = k >= 2 ? prices[k - 2] : currentPrice;
+        const priceLag2 = k >= 3 ? prices[k - 3] : priceLag1;
+        const priceLag3 = k >= 4 ? prices[k - 4] : priceLag2;
+
+        const priceChange = currentPrice - priceLag1;
+        let effectiveMomentum = priceLag1 > 0 ? priceChange / priceLag1 : 0;
+
+        if (k >= 4) {
+            const longerTermChange = currentPrice - priceLag2;
+            if ((priceChange > 0 && longerTermChange > 0) || (priceChange < 0 && longerTermChange < 0)) {
+                effectiveMomentum = (effectiveMomentum + (longerTermChange / (priceLag2 + 0.0001))) * 0.5;
+            }
+        }
+
+        const emaTrend = this.emaShort - this.emaLong;
+        const momentumTrend = effectiveMomentum * 0.5;
+        const priceChangeTrend = k >= 3 ? (currentPrice - priceLag2) / (priceLag2 + 0.0001) * 0.3 : 0;
+        const combinedTrend = emaTrend * 0.4 + momentumTrend * 0.4 + priceChangeTrend * 0.2;
+
+        return {
+            priceLag1: this.normalizePrice(priceLag1),
+            priceLag2: this.normalizePrice(priceLag2),
+            priceLag3: this.normalizePrice(priceLag3),
+            momentum: this.normalizeMomentum(effectiveMomentum),
+            volatility: this.normalizeVolatility(this.calculateVolatility(prices, k)),
+            trend: this.normalizeTrend(combinedTrend),
+        };
+    }
+
     /** Single-pass mean + variance over the last 5 entries — no slice, no reduce. */
     private calculateVolatility(prices: number[], n: number): number {
         if (n < 3) return 0;
@@ -391,21 +433,17 @@ export class AdaptivePricePredictor {
     }
     
     /**
-     * Learn from previous prediction using online gradient descent
+     * Learn from previous prediction using online gradient descent.
+     * Reconstructs the feature vector that *would* have been calculated at time n-1,
+     * so that weight updates correlate to the same features used during prediction.
      */
     private learnFromPreviousPrediction(prices: number[], n: number): void {
         if (n < 4) return;
         const actualPrice = prices[n - 1];
         const previousPrice = prices[n - 2];
-        
-        const prevFeatures = {
-            priceLag1: n >= 3 ? this.normalizePrice(prices[n - 3]) : 0.5,
-            priceLag2: n >= 4 ? this.normalizePrice(prices[n - 4]) : 0.5,
-            priceLag3: n >= 5 ? this.normalizePrice(prices[n - 5]) : 0.5,
-            momentum: this.normalizeMomentum((previousPrice - (n >= 3 ? prices[n - 3] : previousPrice)) / (previousPrice + 0.0001)),
-            volatility: 0.1, // Simplified
-            trend: 0, // Simplified
-        };
+
+        // Reconstruct features as calculateFeatures would have seen them at index n-1
+        const prevFeatures = this.calculateFeaturesAt(prices, n - 1);
         
         const predictedPrice = this.predictPrice(prevFeatures);
         const error = actualPrice - predictedPrice;

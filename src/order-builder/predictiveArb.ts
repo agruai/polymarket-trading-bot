@@ -1,4 +1,4 @@
-import { AssetType, ClobClient, CreateOrderOptions, OrderType, Side, UserOrder } from "@polymarket/clob-client";
+import { AssetType, ClobClient, CreateOrderOptions, OrderType, Side, UserOrder, UserMarketOrder } from "@polymarket/clob-client";
 import * as fs from "fs";
 import * as path from "path";
 import { logger } from "../utils/logger";
@@ -8,7 +8,6 @@ import { AdaptivePricePredictor, PricePrediction } from "../utils/pricePredictor
 import {
     isMarketFullyPaused,
     isSideCapReached,
-    limitFillWouldExceedCap,
 } from "../trading/limits";
 import { bumpMetric, maybeLogMetricsSummary } from "../utils/metrics";
 import { isMinuteAtIntervalBoundary, msUntilSlotEnd, slugForCryptoUpdown } from "../utils/marketInterval";
@@ -67,6 +66,7 @@ type SimpleConfig = {
     maxSpread: number;
     maxSessionSpendUsdc: number;
     maxSpendPerWindowUsdc: number;
+    feeRateBps: number;
     autoRedeem: boolean;
     redeemPollIntervalSeconds: number;
     redeemMaxAttempts: number;
@@ -222,7 +222,7 @@ export class PredictiveArbBot {
         const {
             markets, marketIntervalMinutes, sharesPerSide, tickSize, negRisk, minBalanceUsdc,
             endOfWindowFreezeSeconds, maxSpread, maxSessionSpendUsdc, maxSpendPerWindowUsdc,
-            autoRedeem, redeemPollIntervalSeconds, redeemMaxAttempts,
+            feeRateBps, autoRedeem, redeemPollIntervalSeconds, redeemMaxAttempts,
         } = config.predictiveArb;
         const bot = new PredictiveArbBot(client, {
             markets,
@@ -235,6 +235,7 @@ export class PredictiveArbBot {
             maxSpread,
             maxSessionSpendUsdc,
             maxSpendPerWindowUsdc,
+            feeRateBps,
             autoRedeem,
             redeemPollIntervalSeconds,
             redeemMaxAttempts,
@@ -729,12 +730,16 @@ export class PredictiveArbBot {
      * Place first-side limit buy with one retry on transient failure.
      * Limit price is best-ask + one tick (matches the configured tickSize).
      */
+    /**
+     * Place first-side limit buy with one retry on transient failure.
+     * Returns the actual fill price on success, or null on failure.
+     */
     private async buyFirstSide(
         leg: "YES" | "NO",
         tokenID: string,
         askPrice: number,
         size: number
-    ): Promise<boolean> {
+    ): Promise<{ fillPrice: number } | null> {
         const tick = parseFloat(this.cfg.tickSize as string) || 0.01;
         const limitPrice = askPrice + tick;
         const orderAmount = limitPrice * size;
@@ -760,17 +765,17 @@ export class PredictiveArbBot {
                 if (!orderID) {
                     logger.error(`BUY failed for ${leg} - no orderID returned (attempt ${attempt})`);
                     if (attempt < 2) continue;
-                    return false;
+                    return null;
                 }
                 logger.info(`First-Side Order placed: ${leg} orderID ${orderID.substring(0, 10)}... @ ${limitPrice.toFixed(4)}`);
 
                 // SAFETY: Verify the order actually filled before proceeding to second-side.
-                // Poll up to ~2s; if not filled, cancel to avoid orphaned unhedged positions.
-                const filled = await this.verifyOrderFilled(orderID, 4, 500);
-                if (filled) {
-                    logger.info(`✅ First-Side FILLED: ${leg} orderID ${orderID.substring(0, 10)}...`);
+                const filledOrder = await this.verifyOrderFilled(orderID, 4, 500);
+                if (filledOrder) {
+                    const actualFillPrice = filledOrder.avgPrice ?? limitPrice;
+                    logger.info(`✅ First-Side FILLED: ${leg} orderID ${orderID.substring(0, 10)}... @ ${actualFillPrice.toFixed(4)}`);
                     bumpMetric("firstSideOrdersPlaced");
-                    return true;
+                    return { fillPrice: actualFillPrice };
                 }
 
                 // Not filled within verification window — cancel to avoid naked exposure
@@ -778,9 +783,22 @@ export class PredictiveArbBot {
                 try {
                     await this.client.cancelOrder({ orderID });
                 } catch (cancelErr) {
-                    logger.error(`Failed to cancel unfilled first-side: ${cancelErr instanceof Error ? cancelErr.message : String(cancelErr)}`);
+                    logger.error(`Cancel attempt error: ${cancelErr instanceof Error ? cancelErr.message : String(cancelErr)}`);
                 }
-                return false;
+                // Re-check status after cancel to detect fill-during-cancel race
+                try {
+                    await new Promise(r => setTimeout(r, 300));
+                    const finalOrder = await this.client.getOrder(orderID);
+                    if (finalOrder?.status === "FILLED") {
+                        const raceFillPrice = parseFloat((finalOrder as any).average_price || (finalOrder as any).price) || limitPrice;
+                        logger.info(`⚠️ First-Side filled during cancel race — treating as FILLED: ${orderID.substring(0, 10)}... @ ${raceFillPrice.toFixed(4)}`);
+                        bumpMetric("firstSideOrdersPlaced");
+                        return { fillPrice: raceFillPrice };
+                    }
+                } catch {
+                    // If we can't verify, assume cancelled — safer than assuming filled
+                }
+                return null;
             } catch (e) {
                 logger.error(`BUY failed for ${leg} (attempt ${attempt}): ${e instanceof Error ? e.message : String(e)}`);
                 if (attempt < 2) {
@@ -788,24 +806,27 @@ export class PredictiveArbBot {
                 }
             }
         }
-        return false;
+        return null;
     }
 
     /**
-     * Poll order status to verify fill. Returns true if FILLED within the given attempts.
+     * Poll order status to verify fill. Returns order data with avgPrice if FILLED, null otherwise.
      */
-    private async verifyOrderFilled(orderID: string, maxChecks: number, intervalMs: number): Promise<boolean> {
+    private async verifyOrderFilled(orderID: string, maxChecks: number, intervalMs: number): Promise<{ avgPrice: number | null } | null> {
         for (let i = 0; i < maxChecks; i++) {
             await new Promise(r => setTimeout(r, intervalMs));
             try {
                 const order = await this.client.getOrder(orderID);
-                if (order?.status === "FILLED") return true;
-                if (order?.status === "CANCELLED" || order?.status === "REJECTED") return false;
+                if (order?.status === "FILLED") {
+                    const avg = parseFloat((order as any).average_price || (order as any).price) || null;
+                    return { avgPrice: avg };
+                }
+                if (order?.status === "CANCELLED" || order?.status === "REJECTED") return null;
             } catch {
                 // Transient API error — continue polling
             }
         }
-        return false;
+        return null;
     }
 
     /**
@@ -891,12 +912,25 @@ export class PredictiveArbBot {
         }
 
         const tick = parseFloat(this.cfg.tickSize as string) || 0.01;
-        const firstLegPrice = buyPrice + tick;
-        const secondLegPrice = 0.98 - buyPrice;
-        const firstLegCost = firstLegPrice * this.cfg.sharesPerSide;
-        const secondLegCost = (secondLegPrice > 0 && secondLegPrice < 1) ? secondLegPrice * this.cfg.sharesPerSide : 0;
-        const totalPairCost = firstLegCost + secondLegCost;
+        const feeRate = this.cfg.feeRateBps / 10_000;
+        const feeMultiplier = 1 + feeRate;
         const limitLabel = this.MAX_BUY_COUNTS_PER_SIDE > 0 ? String(this.MAX_BUY_COUNTS_PER_SIDE) : "unlimited";
+
+        // CORE ARB CHECK: Only enter when both sides' asks sum to < $1.00 (the arb condition).
+        // This guarantees that if both legs fill at ask, we profit at resolution.
+        const oppositeAsk = buyToken === "UP" ? downAsk : upAsk;
+        const pairAskSum = buyPrice + oppositeAsk;
+        const feeBuffer = pairAskSum * feeRate;
+        const arbSpread = 1.0 - pairAskSum - feeBuffer;
+        if (arbSpread <= 0) {
+            logger.info(`⛔ No arb: upAsk ${upAsk.toFixed(4)} + downAsk ${downAsk.toFixed(4)} = ${pairAskSum.toFixed(4)} (+ fees ${feeBuffer.toFixed(4)}) >= 1.00 — skipping`);
+            return;
+        }
+
+        const firstLegPrice = buyPrice + tick;
+        const firstLegCost = firstLegPrice * this.cfg.sharesPerSide * feeMultiplier;
+        const secondLegEstimate = (oppositeAsk + tick) * this.cfg.sharesPerSide * feeMultiplier;
+        const totalPairCost = firstLegCost + secondLegEstimate;
 
         // SAFETY: Spread guard — skip if bid-ask spread is too wide
         if (this.cfg.maxSpread > 0) {
@@ -933,40 +967,45 @@ export class PredictiveArbBot {
             }
         }
 
-        logger.info(`🎯 FIRST-SIDE Trade: ${buyToken} @ ${buyPrice.toFixed(4)} (${firstLegCost.toFixed(2)} USDC, pair total ${totalPairCost.toFixed(2)}) | UP ${tokenCounts.upTokenCount}/${limitLabel}, DOWN ${tokenCounts.downTokenCount}/${limitLabel}`);
+        logger.info(`🎯 ARB ENTRY: spread ${(arbSpread * 100).toFixed(2)}% | ${buyToken} @ ${buyPrice.toFixed(4)} + opposite @ ${oppositeAsk.toFixed(4)} = ${pairAskSum.toFixed(4)} | pair cost ${totalPairCost.toFixed(2)} USDC | UP ${tokenCounts.upTokenCount}/${limitLabel}, DOWN ${tokenCounts.downTokenCount}/${limitLabel}`);
 
-        const firstSideOk = await this.buyFirstSide(
+        const firstSideResult = await this.buyFirstSide(
             buyToken === "UP" ? "YES" : "NO",
             tokenId,
             buyPrice,
             this.cfg.sharesPerSide
         );
 
-        if (!firstSideOk) {
+        if (!firstSideResult) {
             logger.error(`❌ First-side order failed for ${buyToken} - skipping second-side`);
             return;
         }
 
-        // Increment counts only after confirmed fill (buyFirstSide now verifies fill)
+        const actualFirstPrice = firstSideResult.fillPrice;
+        const actualFirstCost = actualFirstPrice * this.cfg.sharesPerSide * feeMultiplier;
+
+        // Increment first-side counts
         score.totalPredictions++;
         if (buyToken === "UP") {
             tokenCounts.upTokenCount++;
             score.upTokenCount++;
-            score.upTokenCost += firstLegCost;
+            score.upTokenCost += actualFirstCost;
         } else {
             tokenCounts.downTokenCount++;
             score.downTokenCount++;
-            score.downTokenCost += firstLegCost;
+            score.downTokenCost += actualFirstCost;
         }
 
-        // Deduct estimated cost from local balance tracker and accumulate session spend
-        this.lastKnownBalance = Math.max(0, this.lastKnownBalance - firstLegCost);
-        this.sessionSpendUsdc += firstLegCost;
+        this.lastKnownBalance = Math.max(0, this.lastKnownBalance - actualFirstCost);
+        this.sessionSpendUsdc += actualFirstCost;
 
-        // Place second-side limit order (only after first-side confirmed)
-        this.placeSecondSideLimitOrder(
+        // AGGRESSIVE SECOND LEG: FOK at opposite ask to guarantee the hedge completes.
+        // Max second-leg price = the highest we can pay and still profit at resolution.
+        const maxSecondPrice = 1.0 / feeMultiplier - actualFirstPrice;
+        const secondResult = await this.buySecondSideAggressive(
             buyToken,
-            buyPrice,
+            actualFirstPrice,
+            maxSecondPrice,
             tokenIds,
             market,
             slug,
@@ -974,13 +1013,20 @@ export class PredictiveArbBot {
             tokenCounts
         );
 
+        if (!secondResult.filled) {
+            // BAIL OUT: Second leg failed — sell first leg back at bid to limit loss
+            logger.error(`⚠️ Second-side FOK FAILED — attempting bail-out sell of first leg ${buyToken}`);
+            await this.bailOutFirstLeg(buyToken, tokenId, this.cfg.sharesPerSide);
+            bumpMetric("secondSideBailouts");
+        }
+
         score.trades.push({
             prediction: prediction.direction,
             predictedPrice: prediction.predictedPrice,
-            actualPrice: buyPrice,
+            actualPrice: actualFirstPrice,
             buyToken,
-            buyPrice,
-            buyCost: firstLegCost,
+            buyPrice: actualFirstPrice,
+            buyCost: actualFirstCost + (secondResult.cost || 0),
             timestamp: Date.now(),
             wasCorrect: null,
         });
@@ -997,176 +1043,177 @@ export class PredictiveArbBot {
     }
 
     /**
-     * Place limit order for second side (opposite token) at price (0.98 - firstSidePrice)
+     * Aggressive second-side buy using FOK (Fill-or-Kill) at the opposite token's current ask.
+     * This guarantees the hedge completes immediately or fails entirely.
+     * The limit price is capped at maxSecondPrice to ensure the pair is always profitable.
      */
-    private async placeSecondSideLimitOrder(
+    private async buySecondSideAggressive(
         firstSide: "UP" | "DOWN",
         firstSidePrice: number,
+        maxSecondPrice: number,
         tokenIds: { upTokenId: string; downTokenId: string; conditionId: string; upIdx: number; downIdx: number },
         market: string,
         slug: string,
         scoreKey: string,
         tokenCounts: { upTokenCount: number; downTokenCount: number }
-    ): Promise<void> {
-        // Determine opposite side
+    ): Promise<{ filled: boolean; cost: number }> {
         const oppositeSide = firstSide === "UP" ? "DOWN" : "UP";
         const oppositeTokenId = firstSide === "UP" ? tokenIds.downTokenId : tokenIds.upTokenId;
 
-        // CRITICAL: Check if market is paused FIRST
         if (this.pausedMarkets.has(scoreKey)) {
-            return; // Market is paused, don't place limit orders
+            return { filled: false, cost: 0 };
         }
 
-        // Paired hedge limit on opposite outcome (see strategy.md)
-        const limitPrice = 0.98 - firstSidePrice;
+        // Get the freshest opposite-side ask from the live orderbook
+        const oppositePrice = this.wsOrderBook?.getPrice(oppositeTokenId);
+        const tick = parseFloat(this.cfg.tickSize as string) || 0.01;
+        const currentOppositeAsk = oppositePrice?.bestAsk ?? 0;
 
-        // Ensure limit price is valid (between 0 and 1)
-        if (limitPrice <= 0 || limitPrice >= 1) {
-            logger.error(`⚠️  Invalid limit price calculated: ${limitPrice.toFixed(4)} (from first side price ${firstSidePrice.toFixed(4)})`);
-            return;
+        if (!currentOppositeAsk || currentOppositeAsk <= 0) {
+            logger.error(`⚠️ No ask price for opposite token ${oppositeSide} — cannot complete hedge`);
+            return { filled: false, cost: 0 };
         }
 
-        const limitOrder: UserOrder = {
+        // Aggressive limit = current ask + tick (cross the spread to guarantee fill)
+        // But cap at maxSecondPrice to ensure the pair remains profitable
+        const aggressivePrice = Math.min(currentOppositeAsk + tick, maxSecondPrice);
+
+        if (aggressivePrice <= 0 || aggressivePrice >= 1) {
+            logger.error(`⚠️ Invalid second-side price: ${aggressivePrice.toFixed(4)} (oppositeAsk ${currentOppositeAsk.toFixed(4)}, max ${maxSecondPrice.toFixed(4)})`);
+            return { filled: false, cost: 0 };
+        }
+
+        // If even the current ask exceeds our max profitable price, the arb has vanished
+        if (currentOppositeAsk > maxSecondPrice) {
+            logger.error(`⚠️ Arb vanished: opposite ask ${currentOppositeAsk.toFixed(4)} > max profitable ${maxSecondPrice.toFixed(4)} — cannot hedge`);
+            return { filled: false, cost: 0 };
+        }
+
+        // FOK market order: `amount` = USDC to spend, `price` = max price cap
+        const usdcToSpend = aggressivePrice * this.cfg.sharesPerSide;
+        const fokOrder: UserMarketOrder = {
             tokenID: oppositeTokenId,
             side: Side.BUY,
-            price: limitPrice,
-            size: this.cfg.sharesPerSide,
+            amount: usdcToSpend,
+            price: aggressivePrice,
         };
+
+        const feeMultiplier = 1 + this.cfg.feeRateBps / 10_000;
         const limitLabel = this.MAX_BUY_COUNTS_PER_SIDE > 0 ? String(this.MAX_BUY_COUNTS_PER_SIDE) : "unlimited";
 
-        try {
-            // Place order IMMEDIATELY (await to ensure it's placed within 50ms of first order)
-            const response = await this.client.createAndPostOrder(
-                limitOrder,
-                { tickSize: this.cfg.tickSize, negRisk: this.cfg.negRisk },
-                OrderType.GTC // Good-Till-Cancel for limit orders
-            );
-            
-            const orderID = response?.orderID;
-            // Log second-side limit order placement clearly with limit info
-            const limitCost = limitPrice * this.cfg.sharesPerSide;
-            if (orderID) {
-                bumpMetric("secondSideOrdersPlaced");
-                logger.info(`📋 SECOND-SIDE Limit Order: ${oppositeSide} @ ${limitPrice.toFixed(4)} (${limitCost.toFixed(2)} USDC) | First-Side: ${firstSide} @ ${firstSidePrice.toFixed(4)} | Current: UP ${tokenCounts.upTokenCount}/${limitLabel}, DOWN ${tokenCounts.downTokenCount}/${limitLabel} | Limit: ${limitLabel} per side | OrderID: ${orderID.substring(0, 10)}...`);
-                // Track second-side limit so fills update score (downTokenCost/upTokenCost and counts)
-                const leg = oppositeSide === "UP" ? "YES" : "NO";
-                this.trackLimitOrderAsync(
-                    orderID,
-                    leg,
-                    oppositeTokenId,
-                    tokenIds.conditionId,
-                    this.cfg.sharesPerSide,
-                    limitPrice,
-                    market,
-                    slug,
-                    tokenIds.upIdx,
-                    tokenIds.downIdx,
-                    scoreKey,
-                    tokenCounts
-                ).catch(() => { /* fire-and-forget */ });
-            } else {
-                logger.error(`⚠️  Second-side limit order placement returned no orderID`);
+        for (let attempt = 1; attempt <= 2; attempt++) {
+            try {
+                const response = await this.client.createAndPostMarketOrder(
+                    fokOrder,
+                    { tickSize: this.cfg.tickSize, negRisk: this.cfg.negRisk },
+                    OrderType.FOK
+                );
+
+                const orderID = response?.orderID;
+                if (!orderID) {
+                    logger.error(`Second-side FOK returned no orderID (attempt ${attempt})`);
+                    if (attempt < 2) continue;
+                    return { filled: false, cost: 0 };
+                }
+
+                // FOK: either fully filled or fully rejected — verify
+                const filledOrder = await this.verifyOrderFilled(orderID, 3, 400);
+                if (filledOrder) {
+                    const fillPrice = filledOrder.avgPrice ?? aggressivePrice;
+                    const fillCost = fillPrice * this.cfg.sharesPerSide * feeMultiplier;
+
+                    // Update second-side counts and spend
+                    if (oppositeSide === "UP") {
+                        tokenCounts.upTokenCount++;
+                        const s = this.predictionScores.get(scoreKey);
+                        if (s) { s.upTokenCount++; s.upTokenCost += fillCost; }
+                    } else {
+                        tokenCounts.downTokenCount++;
+                        const s = this.predictionScores.get(scoreKey);
+                        if (s) { s.downTokenCount++; s.downTokenCost += fillCost; }
+                    }
+                    this.lastKnownBalance = Math.max(0, this.lastKnownBalance - fillCost);
+                    this.sessionSpendUsdc += fillCost;
+
+                    const pairTotal = firstSidePrice + fillPrice;
+                    const pairProfit = (1.0 - pairTotal) - (pairTotal * this.cfg.feeRateBps / 10_000);
+                    bumpMetric("secondSideOrdersPlaced");
+                    logger.info(`✅ SECOND-SIDE FOK FILLED: ${oppositeSide} @ ${fillPrice.toFixed(4)} | Pair: ${firstSidePrice.toFixed(4)} + ${fillPrice.toFixed(4)} = ${pairTotal.toFixed(4)} | Profit/share: ${(pairProfit).toFixed(4)} | UP ${tokenCounts.upTokenCount}/${limitLabel}, DOWN ${tokenCounts.downTokenCount}/${limitLabel}`);
+
+                    if (isMarketFullyPaused(this.MAX_BUY_COUNTS_PER_SIDE, tokenCounts.upTokenCount, tokenCounts.downTokenCount)) {
+                        this.pausedMarkets.add(scoreKey);
+                        logger.info(`⏸️ Market ${scoreKey} PAUSED after second-side fill`);
+                    }
+
+                    return { filled: true, cost: fillCost };
+                }
+
+                logger.error(`Second-side FOK not filled (attempt ${attempt})`);
+                if (attempt < 2) {
+                    await new Promise(r => setTimeout(r, 150));
+                }
+            } catch (e) {
+                logger.error(`Second-side FOK error (attempt ${attempt}): ${e instanceof Error ? e.message : String(e)}`);
+                if (attempt < 2) {
+                    await new Promise(r => setTimeout(r, 150));
+                }
             }
-        } catch (e) {
-            logger.error(`❌ Failed to place limit order for ${oppositeSide} token: ${e instanceof Error ? e.message : String(e)}`);
         }
+
+        return { filled: false, cost: 0 };
     }
 
     /**
-     * Track limit order asynchronously and update token counts when filled
+     * Bail-out: sell first-leg tokens back at the best bid to cut losses when the second leg failed.
+     * Uses FOK to ensure the sell either completes fully or not at all.
      */
-    private async trackLimitOrderAsync(
-        orderID: string,
-        leg: "YES" | "NO",
-        tokenID: string,
-        conditionId: string,
-        estimatedShares: number,
-        limitPrice: number,
-        market: string,
-        slug: string,
-        upIdx: number,
-        downIdx: number,
-        scoreKey: string,
-        tokenCounts: { upTokenCount: number; downTokenCount: number }
+    private async bailOutFirstLeg(
+        side: "UP" | "DOWN",
+        tokenId: string,
+        size: number
     ): Promise<void> {
+        const price = this.wsOrderBook?.getPrice(tokenId);
+        const bestBid = price?.bestBid;
+
+        if (!bestBid || bestBid <= 0) {
+            logger.error(`⚠️ BAIL-OUT: No bid for ${side} — holding naked position (no liquidity to exit)`);
+            return;
+        }
+
+        const tick = parseFloat(this.cfg.tickSize as string) || 0.01;
+        // Sell slightly below bid to maximize fill probability
+        const sellPrice = Math.max(tick, bestBid - tick);
+
+        // SELL market order: `amount` = number of shares to sell, `price` = min acceptable price
+        const sellOrder: UserMarketOrder = {
+            tokenID: tokenId,
+            side: Side.SELL,
+            amount: size,
+            price: sellPrice,
+        };
+
         try {
-            // Optimized polling with exponential backoff
-            let attempts = 0;
-            const maxAttempts = 30; // Reduced from 60 to 30 (30 seconds max)
-            let pollInterval = 500; // Start with 500ms, increase gradually
-            const maxInterval = 3000; // Max 3 seconds between checks
+            const response = await this.client.createAndPostMarketOrder(
+                sellOrder,
+                { tickSize: this.cfg.tickSize, negRisk: this.cfg.negRisk },
+                OrderType.FOK
+            );
 
-            while (attempts < maxAttempts) {
-                await new Promise(resolve => setTimeout(resolve, pollInterval));
-                attempts++;
-
-                try {
-                    const order = await this.client.getOrder(orderID);
-
-                    if (order && order.status === "FILLED") {
-                        // CRITICAL: Check limit BEFORE incrementing to prevent exceeding limit
-                        // This prevents race conditions where multiple limit orders fill simultaneously
-                        const wouldExceedLimit = limitFillWouldExceedCap(
-                            this.MAX_BUY_COUNTS_PER_SIDE,
-                            leg,
-                            tokenCounts.upTokenCount,
-                            tokenCounts.downTokenCount
-                        );
-
-                        if (wouldExceedLimit) {
-                            logger.error(`⚠️  Limit order ${orderID} filled but would exceed limit - cancelling count update (${leg}: ${leg === "YES" ? tokenCounts.upTokenCount : tokenCounts.downTokenCount}/${this.MAX_BUY_COUNTS_PER_SIDE})`);
-                            return; // Don't increment count if it would exceed limit
-                        }
-
-                        // Order filled - update token counts and session spend
-                        const fillCost = limitPrice * estimatedShares;
-                        this.lastKnownBalance = Math.max(0, this.lastKnownBalance - fillCost);
-                        this.sessionSpendUsdc += fillCost;
-                        const limitLabel = this.MAX_BUY_COUNTS_PER_SIDE > 0 ? String(this.MAX_BUY_COUNTS_PER_SIDE) : "unlimited";
-
-                        if (leg === "YES") {
-                            tokenCounts.upTokenCount++;
-                            const score = this.predictionScores.get(scoreKey);
-                            if (score) {
-                                score.upTokenCost += fillCost;
-                                score.upTokenCount++;
-                            }
-                        } else {
-                            tokenCounts.downTokenCount++;
-                            const score = this.predictionScores.get(scoreKey);
-                            if (score) {
-                                score.downTokenCost += fillCost;
-                                score.downTokenCount++;
-                            }
-                        }
-
-                        logger.info(`✅ Limit order filled: ${leg} @ ${limitPrice.toFixed(4)} | UP ${tokenCounts.upTokenCount}/${limitLabel}, DOWN ${tokenCounts.downTokenCount}/${limitLabel}`);
-
-                        // Check if we've reached the limit after this fill
-                        if (isMarketFullyPaused(this.MAX_BUY_COUNTS_PER_SIDE, tokenCounts.upTokenCount, tokenCounts.downTokenCount)) {
-                            this.pausedMarkets.add(scoreKey);
-                            logger.info(`⏸️  Market ${scoreKey} PAUSED after limit order fill: UP: ${tokenCounts.upTokenCount}/${this.MAX_BUY_COUNTS_PER_SIDE}, DOWN: ${tokenCounts.downTokenCount}/${this.MAX_BUY_COUNTS_PER_SIDE}`);
-                        }
-
-                        return; // Order filled, stop tracking
-                    } else if (order && (order.status === "CANCELLED" || order.status === "REJECTED")) {
-                        return; // Order cancelled/rejected, stop tracking silently
-                    }
-                } catch (e) {
-                    // Order might not be found yet, continue polling with backoff
-                    // Increase interval gradually (exponential backoff)
-                    if (pollInterval < maxInterval) {
-                        pollInterval = Math.min(pollInterval * 1.5, maxInterval);
-                    }
-                    // Silent polling - no logging to reduce noise
+            const orderID = response?.orderID;
+            if (orderID) {
+                const filled = await this.verifyOrderFilled(orderID, 3, 400);
+                if (filled) {
+                    const exitPrice = filled.avgPrice ?? sellPrice;
+                    logger.info(`✅ BAIL-OUT SOLD: ${side} ${size} shares @ ${exitPrice.toFixed(4)} — exposure closed`);
+                    return;
                 }
             }
-
-            // Silent timeout - limit orders may fill later, no need to log
+            logger.error(`⚠️ BAIL-OUT FOK not filled for ${side} — holding naked position`);
         } catch (e) {
-            logger.error(`❌ Error tracking limit order ${orderID}: ${e instanceof Error ? e.message : String(e)}`);
+            logger.error(`⚠️ BAIL-OUT error for ${side}: ${e instanceof Error ? e.message : String(e)} — holding naked position`);
         }
     }
+
 
     /**
      * Update prediction score with previous prediction result
