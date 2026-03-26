@@ -263,19 +263,24 @@ export class WebSocketOrderBook {
      */
     private handleMessage(data: WebSocket.Data): void {
         try {
+            // Fast PING/PONG detection: check buffer length before full string decode
+            if (Buffer.isBuffer(data)) {
+                if (data.length === 4 && data[0] === 0x50 && data[1] === 0x49 && data[2] === 0x4E && data[3] === 0x47) {
+                    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send("PONG");
+                    return;
+                }
+                if (data.length === 4 && data[0] === 0x50 && data[1] === 0x4F && data[2] === 0x4E && data[3] === 0x47) {
+                    return;
+                }
+            }
+
             const message = data.toString();
 
-            // Handle ping/pong (fast path)
             if (message === "PING") {
-                if (this.ws?.readyState === WebSocket.OPEN) {
-                    this.ws.send("PONG");
-                }
+                if (this.ws?.readyState === WebSocket.OPEN) this.ws.send("PONG");
                 return;
             }
-
-            if (message === "PONG") {
-                return; // Server acknowledged ping
-            }
+            if (message === "PONG") return;
 
             const parsed = JSON.parse(message);
 
@@ -363,18 +368,18 @@ export class WebSocketOrderBook {
             }
         }
 
-        const price: TokenPrice = {
-            tokenId: assetId,
-            bestBid,
-            bestAsk,
-            mid,
-            timestamp,
-        };
+        // Reuse cached TokenPrice object to avoid allocation per tick
+        let price = this.tokenPrices.get(assetId);
+        if (price) {
+            price.bestBid = bestBid;
+            price.bestAsk = bestAsk;
+            price.mid = mid;
+            price.timestamp = timestamp;
+        } else {
+            price = { tokenId: assetId, bestBid, bestAsk, mid, timestamp };
+            this.tokenPrices.set(assetId, price);
+        }
 
-        // Update cache (fast Map operation)
-        this.tokenPrices.set(assetId, price);
-
-        // Notify callback if exists (avoid Map lookup if no callback)
         const callback = this.priceCallbacks.get(assetId);
         if (callback) {
             callback(assetId, price);

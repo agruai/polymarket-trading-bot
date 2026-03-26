@@ -11,7 +11,7 @@ import {
     limitFillWouldExceedCap,
 } from "../trading/limits";
 import { bumpMetric, maybeLogMetricsSummary } from "../utils/metrics";
-import { isMinuteAtIntervalBoundary, slugForCryptoUpdown } from "../utils/marketInterval";
+import { isMinuteAtIntervalBoundary, msUntilSlotEnd, slugForCryptoUpdown } from "../utils/marketInterval";
 
 function parseJsonArray<T>(raw: unknown, ctx: string): T[] {
     if (typeof raw !== "string") throw new Error(`${ctx}: expected JSON string`);
@@ -43,8 +43,8 @@ async function fetchTokenIdsForSlug(
 }
 
 type SimpleStateRow = {
-    previousUpPrice: number | null; // Previous cycle's UP token price
-    lastUpdatedIso: string;
+    previousUpPrice: number | null;
+    lastUpdatedMs: number;
     // Holdings tracking (for redemption)
     conditionId?: string;
     slug?: string;
@@ -62,6 +62,10 @@ type SimpleConfig = {
     tickSize: CreateOrderOptions["tickSize"];
     negRisk: boolean;
     minBalanceUsdc: number;
+    endOfWindowFreezeSeconds: number;
+    maxSpread: number;
+    maxSessionSpendUsdc: number;
+    maxSpendPerWindowUsdc: number;
 };
 
 const STATE_FILE = "src/data/predictive-arb-state.json";
@@ -73,7 +77,7 @@ function statePath(): string {
 function emptyRow(): SimpleStateRow {
     return {
         previousUpPrice: null,
-        lastUpdatedIso: new Date().toISOString(),
+        lastUpdatedMs: Date.now(),
     };
 }
 
@@ -91,7 +95,9 @@ function loadState(): SimpleStateFile {
                 const row = v as any;
                 normalized[k] = {
                     previousUpPrice: typeof row.previousUpPrice === "number" ? row.previousUpPrice : null,
-                    lastUpdatedIso: String(row.lastUpdatedIso ?? new Date().toISOString()),
+                    lastUpdatedMs: typeof row.lastUpdatedMs === "number"
+                        ? row.lastUpdatedMs
+                        : (row.lastUpdatedIso ? new Date(row.lastUpdatedIso).getTime() : Date.now()),
                     conditionId: typeof row.conditionId === "string" ? row.conditionId : undefined,
                     slug: typeof row.slug === "string" ? row.slug : undefined,
                     market: typeof row.market === "string" ? row.market : undefined,
@@ -107,22 +113,25 @@ function loadState(): SimpleStateFile {
     return {};
 }
 
-// Debounced state save
+// Debounced async state save — non-blocking I/O to avoid stalling the event loop
 let saveStateTimer: NodeJS.Timeout | null = null;
+let stateWriteInFlight = false;
 function saveState(state: SimpleStateFile): void {
-    if (saveStateTimer) {
-        clearTimeout(saveStateTimer);
-    }
-    saveStateTimer = setTimeout(() => {
+    if (saveStateTimer) clearTimeout(saveStateTimer);
+    saveStateTimer = setTimeout(async () => {
+        if (stateWriteInFlight) return; // skip if previous write is still in progress
+        stateWriteInFlight = true;
         try {
             const p = statePath();
-            fs.mkdirSync(path.dirname(p), { recursive: true });
-            fs.writeFileSync(p, JSON.stringify(state, null, 2));
+            await fs.promises.mkdir(path.dirname(p), { recursive: true });
+            await fs.promises.writeFile(p, JSON.stringify(state));
         } catch (e) {
             logger.error(`Failed to save state: ${e instanceof Error ? e.message : String(e)}`);
+        } finally {
+            stateWriteInFlight = false;
         }
         saveStateTimer = null;
-    }, 500); // Debounce saves by 500ms
+    }, 500);
 }
 
 export class PredictiveArbBot {
@@ -137,7 +146,10 @@ export class PredictiveArbBot {
     private lastProcessedPrice: Map<string, number> = new Map();
     private pricePredictors: Map<string, AdaptivePricePredictor> = new Map(); // Price predictors per market
     private lastPredictions: Map<string, { prediction: PricePrediction; actualPrice: number; timestamp: number }> = new Map(); // Track predictions for accuracy
-    private marketStartTimeBySlug: Map<string, number> = new Map(); // Track when each market slug started
+    private marketStartTimeBySlug: Map<string, number> = new Map();
+
+    // Slug cache: avoid recomputing slugForCryptoUpdown on every tick
+    private slugCache: Map<string, { slug: string; validUntilMs: number }> = new Map();
 
     // Limit order second side strategy tracking
     private tokenCountsByMarket: Map<string, { upTokenCount: number; downTokenCount: number }> = new Map();
@@ -176,6 +188,9 @@ export class PredictiveArbBot {
     private lastKnownBalance: number = Infinity;
     private lastBalanceRefreshTs: number = 0;
 
+    // Session-level circuit breaker: cumulative USDC spent since bot start
+    private sessionSpendUsdc: number = 0;
+
     constructor(private client: ClobClient, private cfg: SimpleConfig) {
         this.MAX_BUY_COUNTS_PER_SIDE = config.predictiveArb.maxBuyCountsPerSide;
         this.initializationPromise = this.initializeWebSocket();
@@ -197,7 +212,10 @@ export class PredictiveArbBot {
     }
 
     static async fromEnv(client: ClobClient): Promise<PredictiveArbBot> {
-        const { markets, marketIntervalMinutes, sharesPerSide, tickSize, negRisk, minBalanceUsdc } = config.predictiveArb;
+        const {
+            markets, marketIntervalMinutes, sharesPerSide, tickSize, negRisk, minBalanceUsdc,
+            endOfWindowFreezeSeconds, maxSpread, maxSessionSpendUsdc, maxSpendPerWindowUsdc,
+        } = config.predictiveArb;
         const bot = new PredictiveArbBot(client, {
             markets,
             marketIntervalMinutes,
@@ -205,6 +223,10 @@ export class PredictiveArbBot {
             tickSize: tickSize as CreateOrderOptions["tickSize"],
             negRisk,
             minBalanceUsdc,
+            endOfWindowFreezeSeconds,
+            maxSpread,
+            maxSessionSpendUsdc,
+            maxSpendPerWindowUsdc,
         });
         await bot.initializationPromise;
 
@@ -226,6 +248,22 @@ export class PredictiveArbBot {
         const t = this.tokenIdsByMarket[market];
         if (!t || !this.wsOrderBook) return;
         this.wsOrderBook.detachTokenSubscriptions([t.upTokenId, t.downTokenId]);
+    }
+
+    /**
+     * SAFETY: Cancel all open orders for a market's current token IDs.
+     * Called on market rotation to prevent orphaned GTC limits from expired windows.
+     */
+    private async cancelOrdersForMarket(market: string): Promise<void> {
+        const t = this.tokenIdsByMarket[market];
+        if (!t) return;
+        try {
+            await this.client.cancelMarketOrders({ asset_id: t.upTokenId });
+            await this.client.cancelMarketOrders({ asset_id: t.downTokenId });
+            logger.info(`Cancelled open orders for ${market} (slug: ${t.slug})`);
+        } catch (e) {
+            logger.error(`Failed to cancel orders for ${market}: ${e instanceof Error ? e.message : String(e)}`);
+        }
     }
 
     /**
@@ -410,6 +448,8 @@ export class PredictiveArbBot {
 
             logger.info(`🔄 Re-initializing market ${market} with new slug ${slug}`);
             try {
+                // SAFETY: Cancel unfilled orders from the previous market cycle
+                await this.cancelOrdersForMarket(market);
                 this.detachMarketWebSocketFeeds(market);
                 const newTokenIds = await fetchTokenIdsForSlug(slug);
                 this.tokenIdsByMarket[market] = { slug, ...newTokenIds };
@@ -447,7 +487,7 @@ export class PredictiveArbBot {
         row.market = market;
         row.upIdx = currentTokenIds.upIdx;
         row.downIdx = currentTokenIds.downIdx;
-        row.lastUpdatedIso = new Date().toISOString();
+        row.lastUpdatedMs = Date.now();
 
         let predictor = this.pricePredictors.get(market);
         if (!predictor) {
@@ -485,6 +525,14 @@ export class PredictiveArbBot {
 
         logger.info(`🔮 PREDICT [POLE]: ${prediction.predictedPrice.toFixed(4)} (current: ${upAsk.toFixed(4)}) | Direction: ${prediction.direction.toUpperCase()} | Confidence: ${(prediction.confidence * 100).toFixed(1)}% | Signal: ${prediction.signal} | Momentum: ${prediction.features.momentum.toFixed(3)} | Vol: ${prediction.features.volatility.toFixed(3)} | Trend: ${prediction.features.trend.toFixed(3)}`);
 
+        // SAFETY: End-of-window freeze — skip trading when too close to market resolution
+        const msRemaining = msUntilSlotEnd(this.cfg.marketIntervalMinutes);
+        if (this.cfg.endOfWindowFreezeSeconds > 0 && msRemaining < this.cfg.endOfWindowFreezeSeconds * 1000) {
+            logger.info(`⏳ End-of-window freeze: ${(msRemaining / 1000).toFixed(0)}s remaining < ${this.cfg.endOfWindowFreezeSeconds}s freeze — skipping trade`);
+            row.previousUpPrice = upAsk;
+            return;
+        }
+
         // Per-market lock: prevent a second price tick from entering executePredictionTrade
         // while the first is still awaiting the CLOB API.
         if (this.tradingLock.has(market)) {
@@ -510,7 +558,13 @@ export class PredictiveArbBot {
     }
 
     private getSlugForMarket(market: string): string {
-        return slugForCryptoUpdown(market, this.cfg.marketIntervalMinutes);
+        const now = Date.now();
+        const cached = this.slugCache.get(market);
+        if (cached && now < cached.validUntilMs) return cached.slug;
+        const slug = slugForCryptoUpdown(market, this.cfg.marketIntervalMinutes);
+        const validUntilMs = now + msUntilSlotEnd(this.cfg.marketIntervalMinutes);
+        this.slugCache.set(market, { slug, validUntilMs });
+        return slug;
     }
 
     /**
@@ -549,6 +603,8 @@ export class PredictiveArbBot {
         this.pausedMarkets.delete(prevScoreKey);
 
         try {
+            // SAFETY: Cancel unfilled orders from the previous market cycle
+            await this.cancelOrdersForMarket(market);
             this.detachMarketWebSocketFeeds(market);
             const newTokenIds = await fetchTokenIdsForSlug(newSlug);
             this.tokenIdsByMarket[market] = { slug: newSlug, ...newTokenIds };
@@ -612,14 +668,47 @@ export class PredictiveArbBot {
                     if (attempt < 2) continue;
                     return false;
                 }
-                logger.info(`✅ First-Side Order placed: ${leg} orderID ${orderID.substring(0, 10)}... @ ${limitPrice.toFixed(4)}`);
-                bumpMetric("firstSideOrdersPlaced");
-                return true;
+                logger.info(`First-Side Order placed: ${leg} orderID ${orderID.substring(0, 10)}... @ ${limitPrice.toFixed(4)}`);
+
+                // SAFETY: Verify the order actually filled before proceeding to second-side.
+                // Poll up to ~2s; if not filled, cancel to avoid orphaned unhedged positions.
+                const filled = await this.verifyOrderFilled(orderID, 4, 500);
+                if (filled) {
+                    logger.info(`✅ First-Side FILLED: ${leg} orderID ${orderID.substring(0, 10)}...`);
+                    bumpMetric("firstSideOrdersPlaced");
+                    return true;
+                }
+
+                // Not filled within verification window — cancel to avoid naked exposure
+                logger.error(`First-Side NOT FILLED within 2s — cancelling ${orderID.substring(0, 10)}...`);
+                try {
+                    await this.client.cancelOrder({ orderID });
+                } catch (cancelErr) {
+                    logger.error(`Failed to cancel unfilled first-side: ${cancelErr instanceof Error ? cancelErr.message : String(cancelErr)}`);
+                }
+                return false;
             } catch (e) {
                 logger.error(`BUY failed for ${leg} (attempt ${attempt}): ${e instanceof Error ? e.message : String(e)}`);
                 if (attempt < 2) {
                     await new Promise(r => setTimeout(r, 200));
                 }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Poll order status to verify fill. Returns true if FILLED within the given attempts.
+     */
+    private async verifyOrderFilled(orderID: string, maxChecks: number, intervalMs: number): Promise<boolean> {
+        for (let i = 0; i < maxChecks; i++) {
+            await new Promise(r => setTimeout(r, intervalMs));
+            try {
+                const order = await this.client.getOrder(orderID);
+                if (order?.status === "FILLED") return true;
+                if (order?.status === "CANCELLED" || order?.status === "REJECTED") return false;
+            } catch {
+                // Transient API error — continue polling
             }
         }
         return false;
@@ -707,18 +796,50 @@ export class PredictiveArbBot {
             return;
         }
 
-        const buyCost = buyPrice * this.cfg.sharesPerSide;
+        const tick = parseFloat(this.cfg.tickSize as string) || 0.01;
+        const firstLegPrice = buyPrice + tick;
+        const secondLegPrice = 0.98 - buyPrice;
+        const firstLegCost = firstLegPrice * this.cfg.sharesPerSide;
+        const secondLegCost = (secondLegPrice > 0 && secondLegPrice < 1) ? secondLegPrice * this.cfg.sharesPerSide : 0;
+        const totalPairCost = firstLegCost + secondLegCost;
         const limitLabel = this.MAX_BUY_COUNTS_PER_SIDE > 0 ? String(this.MAX_BUY_COUNTS_PER_SIDE) : "unlimited";
+
+        // SAFETY: Spread guard — skip if bid-ask spread is too wide
+        if (this.cfg.maxSpread > 0) {
+            const tokenPrice = this.wsOrderBook?.getPrice(tokenId);
+            if (tokenPrice?.bestBid != null && tokenPrice?.bestAsk != null) {
+                const spread = tokenPrice.bestAsk - tokenPrice.bestBid;
+                if (spread > this.cfg.maxSpread) {
+                    logger.info(`⛔ Spread too wide: ${spread.toFixed(4)} > max ${this.cfg.maxSpread} — skipping trade`);
+                    return;
+                }
+            }
+        }
 
         await this.refreshBalanceEstimate();
 
-        // Enforce minimum balance before placing any order
-        if (this.cfg.minBalanceUsdc > 0 && this.lastKnownBalance < this.cfg.minBalanceUsdc) {
-            logger.error(`⛔ Balance gate: estimated available ${this.lastKnownBalance.toFixed(2)} USDC < min ${this.cfg.minBalanceUsdc} USDC - skipping trade`);
+        // SAFETY: Pre-flight affordability — verify bot can cover BOTH legs plus reserve
+        if (this.lastKnownBalance < totalPairCost + this.cfg.minBalanceUsdc) {
+            logger.error(`⛔ Pre-flight: balance ${this.lastKnownBalance.toFixed(2)} < pair cost ${totalPairCost.toFixed(2)} + reserve ${this.cfg.minBalanceUsdc} — skipping trade`);
             return;
         }
 
-        logger.info(`🎯 FIRST-SIDE Trade: ${buyToken} @ ${buyPrice.toFixed(4)} (${buyCost.toFixed(2)} USDC) | UP ${tokenCounts.upTokenCount}/${limitLabel}, DOWN ${tokenCounts.downTokenCount}/${limitLabel} | Limit: ${limitLabel} per side`);
+        // SAFETY: Session spending limit (circuit breaker)
+        if (this.cfg.maxSessionSpendUsdc > 0 && this.sessionSpendUsdc + totalPairCost > this.cfg.maxSessionSpendUsdc) {
+            logger.error(`⛔ Session limit: spent ${this.sessionSpendUsdc.toFixed(2)} + pair ${totalPairCost.toFixed(2)} > max ${this.cfg.maxSessionSpendUsdc} — skipping trade`);
+            return;
+        }
+
+        // SAFETY: Per-window spending limit
+        if (this.cfg.maxSpendPerWindowUsdc > 0) {
+            const windowSpend = score.upTokenCost + score.downTokenCost;
+            if (windowSpend + totalPairCost > this.cfg.maxSpendPerWindowUsdc) {
+                logger.info(`⛔ Window limit: spent ${windowSpend.toFixed(2)} + pair ${totalPairCost.toFixed(2)} > max ${this.cfg.maxSpendPerWindowUsdc} — skipping trade`);
+                return;
+            }
+        }
+
+        logger.info(`🎯 FIRST-SIDE Trade: ${buyToken} @ ${buyPrice.toFixed(4)} (${firstLegCost.toFixed(2)} USDC, pair total ${totalPairCost.toFixed(2)}) | UP ${tokenCounts.upTokenCount}/${limitLabel}, DOWN ${tokenCounts.downTokenCount}/${limitLabel}`);
 
         const firstSideOk = await this.buyFirstSide(
             buyToken === "UP" ? "YES" : "NO",
@@ -732,20 +853,21 @@ export class PredictiveArbBot {
             return;
         }
 
-        // Increment counts only after confirmed placement
+        // Increment counts only after confirmed fill (buyFirstSide now verifies fill)
         score.totalPredictions++;
         if (buyToken === "UP") {
             tokenCounts.upTokenCount++;
             score.upTokenCount++;
-            score.upTokenCost += buyCost;
+            score.upTokenCost += firstLegCost;
         } else {
             tokenCounts.downTokenCount++;
             score.downTokenCount++;
-            score.downTokenCost += buyCost;
+            score.downTokenCost += firstLegCost;
         }
 
-        // Deduct estimated cost from local balance tracker
-        this.lastKnownBalance = Math.max(0, this.lastKnownBalance - buyCost);
+        // Deduct estimated cost from local balance tracker and accumulate session spend
+        this.lastKnownBalance = Math.max(0, this.lastKnownBalance - firstLegCost);
+        this.sessionSpendUsdc += firstLegCost;
 
         // Place second-side limit order (only after first-side confirmed)
         this.placeSecondSideLimitOrder(
@@ -764,7 +886,7 @@ export class PredictiveArbBot {
             actualPrice: buyPrice,
             buyToken,
             buyPrice,
-            buyCost,
+            buyCost: firstLegCost,
             timestamp: Date.now(),
             wasCorrect: null,
         });
@@ -902,9 +1024,10 @@ export class PredictiveArbBot {
                             return; // Don't increment count if it would exceed limit
                         }
 
-                        // Order filled - update token counts
+                        // Order filled - update token counts and session spend
                         const fillCost = limitPrice * estimatedShares;
                         this.lastKnownBalance = Math.max(0, this.lastKnownBalance - fillCost);
+                        this.sessionSpendUsdc += fillCost;
                         const limitLabel = this.MAX_BUY_COUNTS_PER_SIDE > 0 ? String(this.MAX_BUY_COUNTS_PER_SIDE) : "unlimited";
 
                         if (leg === "YES") {
@@ -1022,8 +1145,9 @@ export class PredictiveArbBot {
         logger.info(`\n💵 TOTAL COST: ${totalCost.toFixed(2)} USDC`);
         logger.info(`${"=".repeat(80)}\n`);
 
-        // Remove from active tracking (summary generated)
+        // Remove from active tracking (summary generated) and clean up stale maps
         this.predictionScores.delete(scoreKey);
+        this.marketStartTimeBySlug.delete(prevSlug);
     }
 
     /**

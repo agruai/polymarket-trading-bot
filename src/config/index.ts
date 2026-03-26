@@ -89,7 +89,11 @@ export const config = {
             "0.01") as "0.01" | "0.001" | "0.0001" | string,
         negRisk: envBool("COPYTRADE_NEG_RISK", envBool("GABAGOOL_NEG_RISK", false)),
         minBalanceUsdc: envNumber("COPYTRADE_MIN_BALANCE_USDC", 1),
-        maxBuyCountsPerSide: envNumber("COPYTRADE_MAX_BUY_COUNTS_PER_SIDE", 0), // Maximum buy counts per side (UP/DOWN) per market before pausing
+        maxBuyCountsPerSide: envNumber("COPYTRADE_MAX_BUY_COUNTS_PER_SIDE", 0),
+        endOfWindowFreezeSeconds: envNumber("COPYTRADE_END_OF_WINDOW_FREEZE_SECONDS", 45),
+        maxSpread: envNumber("COPYTRADE_MAX_SPREAD", 0.06),
+        maxSessionSpendUsdc: envNumber("COPYTRADE_MAX_SESSION_SPEND_USDC", 0),
+        maxSpendPerWindowUsdc: envNumber("COPYTRADE_MAX_SPEND_PER_WINDOW_USDC", 0),
     },
 
     /** Redeem script args via env */

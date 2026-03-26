@@ -4,6 +4,7 @@ import {
     assertMarketIntervalMinutes,
     isMinuteAtIntervalBoundary,
     msUntilNextIntervalBoundary,
+    msUntilSlotEnd,
     slugForCryptoUpdown,
     slotStartUnixSeconds,
 } from "../utils/marketInterval";
@@ -36,4 +37,26 @@ test("slug uses interval in path segment", () => {
 test("msUntilNextIntervalBoundary is non-negative", () => {
     assert.ok(msUntilNextIntervalBoundary(5) >= 0);
     assert.ok(msUntilNextIntervalBoundary(15) >= 0);
+});
+
+test("msUntilSlotEnd returns correct remaining ms", () => {
+    const d = new Date(2026, 2, 23, 14, 7, 30, 0); // 14:07:30 → slot 14:05, ends 14:10
+    const ms = msUntilSlotEnd(5, d);
+    // 14:10:00 - 14:07:30 = 150 seconds = 150_000 ms
+    assert.equal(ms, 150_000);
+});
+
+test("msUntilSlotEnd at boundary returns full interval", () => {
+    const d = new Date(2026, 2, 23, 14, 5, 0, 0); // exactly 14:05:00
+    const ms = msUntilSlotEnd(5, d);
+    assert.equal(ms, 5 * 60 * 1000); // full 5 minutes
+});
+
+test("msUntilSlotEnd is always non-negative and <= interval", () => {
+    const ms5 = msUntilSlotEnd(5);
+    assert.ok(ms5 >= 0);
+    assert.ok(ms5 <= 5 * 60 * 1000);
+    const ms15 = msUntilSlotEnd(15);
+    assert.ok(ms15 >= 0);
+    assert.ok(ms15 <= 15 * 60 * 1000);
 });

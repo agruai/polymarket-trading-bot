@@ -14,6 +14,16 @@ let cachedConfig: { chainId: number; host: string } | null = null;
  * If credential file is missing, creates it automatically via createOrDeriveApiKey.
  */
 export async function getClobClient(): Promise<ClobClient> {
+    const chainId = (config.chainId || Chain.POLYGON) as Chain;
+    const host = config.clobApiUrl;
+
+    // Fast path: return cached client without touching disk
+    if (cachedClient && cachedConfig && 
+        cachedConfig.chainId === chainId && 
+        cachedConfig.host === host) {
+        return cachedClient;
+    }
+
     if (!existsSync(credentialPath())) {
         const ok = await ensureCredential();
         if (!ok) {
@@ -24,16 +34,6 @@ export async function getClobClient(): Promise<ClobClient> {
     }
 
     const creds: ApiKeyCreds = JSON.parse(readFileSync(credentialPath(), "utf-8"));
-    
-    const chainId = (config.chainId || Chain.POLYGON) as Chain;
-    const host = config.clobApiUrl;
-
-    // Return cached client if config hasn't changed
-    if (cachedClient && cachedConfig && 
-        cachedConfig.chainId === chainId && 
-        cachedConfig.host === host) {
-        return cachedClient;
-    }
 
     // Create wallet from private key
     const privateKey = config.requirePrivateKey();
