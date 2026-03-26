@@ -83,7 +83,7 @@ The signal requires alignment of trend, momentum, volatility, and confidence thr
 | 1 | **Confidence** | `prediction.confidence >= 0.50` |
 | 2 | **Signal** | Not `"HOLD"` |
 | 3 | **Market not paused** | Per-side buy cap not reached |
-| 4 | **Arb condition** | `upAsk + downAsk + fees < 1.00` |
+| 4 | **Arb condition** | `(upAsk + tick) + (downAsk + tick) + fees < 1.00` (uses actual execution prices, not raw asks) |
 | 5 | **Spread guard** | Bid-ask spread < `COPYTRADE_MAX_SPREAD` |
 | 6 | **Balance check** | USDC balance >= pair cost + reserve |
 | 7 | **Session limit** | Cumulative spend < `COPYTRADE_MAX_SESSION_SPEND_USDC` |

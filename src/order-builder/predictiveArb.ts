@@ -159,6 +159,7 @@ export class PredictiveArbBot {
     private tokenCountsByMarket: Map<string, { upTokenCount: number; downTokenCount: number }> = new Map();
     private pausedMarkets: Set<string> = new Set();
     private readonly MAX_BUY_COUNTS_PER_SIDE: number;
+    private readonly tick: number;
     private tradingLock: Set<string> = new Set();
 
     // Auto-redemption tracking
@@ -200,6 +201,7 @@ export class PredictiveArbBot {
 
     constructor(private client: ClobClient, private cfg: SimpleConfig) {
         this.MAX_BUY_COUNTS_PER_SIDE = config.predictiveArb.maxBuyCountsPerSide;
+        this.tick = parseFloat(cfg.tickSize as string) || 0.01;
         this.initializationPromise = this.initializeWebSocket();
     }
 
@@ -728,10 +730,6 @@ export class PredictiveArbBot {
 
     /**
      * Place first-side limit buy with one retry on transient failure.
-     * Limit price is best-ask + one tick (matches the configured tickSize).
-     */
-    /**
-     * Place first-side limit buy with one retry on transient failure.
      * Returns the actual fill price on success, or null on failure.
      */
     private async buyFirstSide(
@@ -740,7 +738,7 @@ export class PredictiveArbBot {
         askPrice: number,
         size: number
     ): Promise<{ fillPrice: number } | null> {
-        const tick = parseFloat(this.cfg.tickSize as string) || 0.01;
+        const tick = this.tick;
         const limitPrice = askPrice + tick;
         const orderAmount = limitPrice * size;
 
@@ -911,25 +909,26 @@ export class PredictiveArbBot {
             return;
         }
 
-        const tick = parseFloat(this.cfg.tickSize as string) || 0.01;
+        const tick = this.tick;
         const feeRate = this.cfg.feeRateBps / 10_000;
         const feeMultiplier = 1 + feeRate;
         const limitLabel = this.MAX_BUY_COUNTS_PER_SIDE > 0 ? String(this.MAX_BUY_COUNTS_PER_SIDE) : "unlimited";
 
-        // CORE ARB CHECK: Only enter when both sides' asks sum to < $1.00 (the arb condition).
-        // This guarantees that if both legs fill at ask, we profit at resolution.
+        // CORE ARB CHECK: Both legs buy at ask + tick, so the real pair price includes 2*tick.
+        // Only enter when the actual execution cost sums to < $1.00 after fees.
         const oppositeAsk = buyToken === "UP" ? downAsk : upAsk;
-        const pairAskSum = buyPrice + oppositeAsk;
-        const feeBuffer = pairAskSum * feeRate;
-        const arbSpread = 1.0 - pairAskSum - feeBuffer;
+        const firstLegPrice = buyPrice + tick;
+        const secondLegEstimatedPrice = oppositeAsk + tick;
+        const pairExecSum = firstLegPrice + secondLegEstimatedPrice;
+        const feeBuffer = pairExecSum * feeRate;
+        const arbSpread = 1.0 - pairExecSum - feeBuffer;
         if (arbSpread <= 0) {
-            logger.info(`⛔ No arb: upAsk ${upAsk.toFixed(4)} + downAsk ${downAsk.toFixed(4)} = ${pairAskSum.toFixed(4)} (+ fees ${feeBuffer.toFixed(4)}) >= 1.00 — skipping`);
+            logger.info(`⛔ No arb: buy ${firstLegPrice.toFixed(4)} + opposite ${secondLegEstimatedPrice.toFixed(4)} = ${pairExecSum.toFixed(4)} (+ fees ${feeBuffer.toFixed(4)}) >= 1.00 — skipping`);
             return;
         }
 
-        const firstLegPrice = buyPrice + tick;
         const firstLegCost = firstLegPrice * this.cfg.sharesPerSide * feeMultiplier;
-        const secondLegEstimate = (oppositeAsk + tick) * this.cfg.sharesPerSide * feeMultiplier;
+        const secondLegEstimate = secondLegEstimatedPrice * this.cfg.sharesPerSide * feeMultiplier;
         const totalPairCost = firstLegCost + secondLegEstimate;
 
         // SAFETY: Spread guard — skip if bid-ask spread is too wide
@@ -967,7 +966,7 @@ export class PredictiveArbBot {
             }
         }
 
-        logger.info(`🎯 ARB ENTRY: spread ${(arbSpread * 100).toFixed(2)}% | ${buyToken} @ ${buyPrice.toFixed(4)} + opposite @ ${oppositeAsk.toFixed(4)} = ${pairAskSum.toFixed(4)} | pair cost ${totalPairCost.toFixed(2)} USDC | UP ${tokenCounts.upTokenCount}/${limitLabel}, DOWN ${tokenCounts.downTokenCount}/${limitLabel}`);
+        logger.info(`🎯 ARB ENTRY: spread ${(arbSpread * 100).toFixed(2)}% | ${buyToken} @ ${firstLegPrice.toFixed(4)} + opposite @ ${secondLegEstimatedPrice.toFixed(4)} = ${pairExecSum.toFixed(4)} | pair cost ${totalPairCost.toFixed(2)} USDC | UP ${tokenCounts.upTokenCount}/${limitLabel}, DOWN ${tokenCounts.downTokenCount}/${limitLabel}`);
 
         const firstSideResult = await this.buyFirstSide(
             buyToken === "UP" ? "YES" : "NO",
@@ -1066,7 +1065,7 @@ export class PredictiveArbBot {
 
         // Get the freshest opposite-side ask from the live orderbook
         const oppositePrice = this.wsOrderBook?.getPrice(oppositeTokenId);
-        const tick = parseFloat(this.cfg.tickSize as string) || 0.01;
+        const tick = this.tick;
         const currentOppositeAsk = oppositePrice?.bestAsk ?? 0;
 
         if (!currentOppositeAsk || currentOppositeAsk <= 0) {
@@ -1180,7 +1179,7 @@ export class PredictiveArbBot {
             return;
         }
 
-        const tick = parseFloat(this.cfg.tickSize as string) || 0.01;
+        const tick = this.tick;
         // Sell slightly below bid to maximize fill probability
         const sellPrice = Math.max(tick, bestBid - tick);
 
