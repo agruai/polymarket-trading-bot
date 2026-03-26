@@ -12,6 +12,7 @@ import {
 } from "../trading/limits";
 import { bumpMetric, maybeLogMetricsSummary } from "../utils/metrics";
 import { isMinuteAtIntervalBoundary, msUntilSlotEnd, slugForCryptoUpdown } from "../utils/marketInterval";
+import { checkConditionResolution, redeemMarket } from "../utils/redeem";
 
 function parseJsonArray<T>(raw: unknown, ctx: string): T[] {
     if (typeof raw !== "string") throw new Error(`${ctx}: expected JSON string`);
@@ -66,6 +67,9 @@ type SimpleConfig = {
     maxSpread: number;
     maxSessionSpendUsdc: number;
     maxSpendPerWindowUsdc: number;
+    autoRedeem: boolean;
+    redeemPollIntervalSeconds: number;
+    redeemMaxAttempts: number;
 };
 
 const STATE_FILE = "src/data/predictive-arb-state.json";
@@ -155,7 +159,10 @@ export class PredictiveArbBot {
     private tokenCountsByMarket: Map<string, { upTokenCount: number; downTokenCount: number }> = new Map();
     private pausedMarkets: Set<string> = new Set();
     private readonly MAX_BUY_COUNTS_PER_SIDE: number;
-    private tradingLock: Set<string> = new Set(); // Per-market lock to prevent concurrent trade execution
+    private tradingLock: Set<string> = new Set();
+
+    // Auto-redemption tracking
+    private pendingRedemptions: Set<string> = new Set();
 
     // Prediction scoring system
     private predictionScores: Map<string, {
@@ -215,6 +222,7 @@ export class PredictiveArbBot {
         const {
             markets, marketIntervalMinutes, sharesPerSide, tickSize, negRisk, minBalanceUsdc,
             endOfWindowFreezeSeconds, maxSpread, maxSessionSpendUsdc, maxSpendPerWindowUsdc,
+            autoRedeem, redeemPollIntervalSeconds, redeemMaxAttempts,
         } = config.predictiveArb;
         const bot = new PredictiveArbBot(client, {
             markets,
@@ -227,6 +235,9 @@ export class PredictiveArbBot {
             maxSpread,
             maxSessionSpendUsdc,
             maxSpendPerWindowUsdc,
+            autoRedeem,
+            redeemPollIntervalSeconds,
+            redeemMaxAttempts,
         });
         await bot.initializationPromise;
 
@@ -264,6 +275,73 @@ export class PredictiveArbBot {
         } catch (e) {
             logger.error(`Failed to cancel orders for ${market}: ${e instanceof Error ? e.message : String(e)}`);
         }
+    }
+
+    /**
+     * Schedule background redemption for a completed market pool.
+     * Waits for on-chain resolution then redeems winning conditional tokens.
+     */
+    private scheduleRedemption(conditionId: string, market: string, slug: string): void {
+        if (this.pendingRedemptions.has(conditionId)) {
+            logger.info(`Redemption already pending for ${conditionId.substring(0, 12)}... — skipping`);
+            return;
+        }
+        this.pendingRedemptions.add(conditionId);
+
+        const pollMs = this.cfg.redeemPollIntervalSeconds * 1000;
+        const maxAttempts = this.cfg.redeemMaxAttempts;
+
+        logger.info(`🔔 Auto-redeem STARTING NOW for ${market} (${slug}) — conditionId ${conditionId.substring(0, 12)}...`);
+
+        // Fire immediately — no initial delay. Poll until resolved.
+        const run = async () => {
+            try {
+                for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+                    if (this.isStopped) {
+                        logger.info(`Auto-redeem cancelled (bot stopped) for ${conditionId.substring(0, 12)}...`);
+                        return;
+                    }
+
+                    try {
+                        const resolution = await checkConditionResolution(conditionId);
+                        if (resolution.isResolved) {
+                            logger.info(`✅ Market resolved for ${market} (${slug}) — redeeming immediately...`);
+                            try {
+                                await redeemMarket(conditionId);
+                                logger.success(`💰 Auto-redeem SUCCESS for ${market} (${slug}) — conditionId ${conditionId.substring(0, 12)}...`);
+                                await this.refreshBalanceEstimate(true);
+                            } catch (redeemErr) {
+                                const msg = redeemErr instanceof Error ? redeemErr.message : String(redeemErr);
+                                if (msg.includes("don't hold any winning tokens") || msg.includes("don't have any tokens")) {
+                                    logger.info(`No winning tokens to redeem for ${market} (${slug}) — skipping`);
+                                } else {
+                                    logger.error(`Auto-redeem failed for ${conditionId.substring(0, 12)}...: ${msg}`);
+                                }
+                            }
+                            return;
+                        }
+
+                        if (attempt < maxAttempts) {
+                            logger.debug(`Auto-redeem poll ${attempt}/${maxAttempts}: not resolved yet for ${market} (${slug}) — retrying in ${this.cfg.redeemPollIntervalSeconds}s`);
+                            await new Promise(r => setTimeout(r, pollMs));
+                        }
+                    } catch (pollErr) {
+                        logger.error(`Auto-redeem poll error (attempt ${attempt}/${maxAttempts}): ${pollErr instanceof Error ? pollErr.message : String(pollErr)}`);
+                        if (attempt < maxAttempts) {
+                            await new Promise(r => setTimeout(r, pollMs));
+                        }
+                    }
+                }
+                logger.error(`Auto-redeem gave up after ${maxAttempts} attempts for ${market} (${slug}) — conditionId ${conditionId.substring(0, 12)}...`);
+            } finally {
+                this.pendingRedemptions.delete(conditionId);
+            }
+        };
+
+        run().catch(err => {
+            logger.error(`Auto-redeem unexpected error: ${err instanceof Error ? err.message : String(err)}`);
+            this.pendingRedemptions.delete(conditionId);
+        });
     }
 
     /**
@@ -339,6 +417,11 @@ export class PredictiveArbBot {
 
     stop(): void {
         this.isStopped = true;
+
+        // Signal pending redemption loops to stop (they check isStopped each iteration)
+        if (this.pendingRedemptions.size > 0) {
+            logger.info(`${this.pendingRedemptions.size} redemption(s) in flight — will exit on next poll`);
+        }
 
         // Force-generate summaries regardless of interval boundary
         logger.info("\n🛑 Generating final prediction summaries...");
@@ -440,6 +523,7 @@ export class PredictiveArbBot {
         const prevSlug = this.lastSlugByMarket[market];
         if (prevSlug && prevSlug !== slug) {
             logger.info(`🔄 New market cycle detected for ${market}: ${prevSlug} → ${slug}`);
+            const prevConditionId = this.tokenIdsByMarket[market]?.conditionId;
             this.generatePredictionScoreSummary(prevSlug, market);
 
             const prevScoreKey = `${market}-${prevSlug}`;
@@ -464,6 +548,10 @@ export class PredictiveArbBot {
                 const errorMsg = e instanceof Error ? e.message : String(e);
                 logger.error(`⚠️  Failed to re-initialize market ${market} with new slug ${slug}: ${errorMsg}. Will retry on next price update.`);
                 return;
+            }
+
+            if (prevConditionId && this.cfg.autoRedeem) {
+                this.scheduleRedemption(prevConditionId, market, prevSlug);
             }
 
             this.lastSlugByMarket[market] = slug;
@@ -594,6 +682,8 @@ export class PredictiveArbBot {
     private async reinitializeMarketForNewCycle(market: string, prevSlug: string, newSlug: string): Promise<void> {
         logger.info(`🔄 Re-initializing market ${market} with new slug ${newSlug} (from periodic check)`);
 
+        const prevConditionId = this.tokenIdsByMarket[market]?.conditionId;
+
         // Generate prediction score summary for previous market
         this.generatePredictionScoreSummary(prevSlug, market);
 
@@ -625,6 +715,10 @@ export class PredictiveArbBot {
             const scoreKey = `${market}-${newSlug}`;
             this.marketStartTimeBySlug.set(scoreKey, Date.now());
             logger.info(`✅ Market ${market} re-initialized with new token IDs for cycle ${newSlug}`);
+
+            if (prevConditionId && this.cfg.autoRedeem) {
+                this.scheduleRedemption(prevConditionId, market, prevSlug);
+            }
         } catch (e) {
             const errorMsg = e instanceof Error ? e.message : String(e);
             logger.error(`⚠️  Failed to re-initialize market ${market} with new slug ${newSlug}: ${errorMsg}. Will retry on next check.`);

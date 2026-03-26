@@ -94,6 +94,9 @@ export const config = {
         maxSpread: envNumber("COPYTRADE_MAX_SPREAD", 0.06),
         maxSessionSpendUsdc: envNumber("COPYTRADE_MAX_SESSION_SPEND_USDC", 0),
         maxSpendPerWindowUsdc: envNumber("COPYTRADE_MAX_SPEND_PER_WINDOW_USDC", 0),
+        autoRedeem: envBool("COPYTRADE_AUTO_REDEEM", true),
+        redeemPollIntervalSeconds: envNumber("COPYTRADE_REDEEM_POLL_INTERVAL_SECONDS", 15),
+        redeemMaxAttempts: envNumber("COPYTRADE_REDEEM_MAX_ATTEMPTS", 20),
     },
 
     /** Redeem script args via env */
