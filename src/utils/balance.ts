@@ -1,5 +1,23 @@
-import { ClobClient, AssetType, type OpenOrder } from "@polymarket/clob-client";
+import { Chain, ClobClient, AssetType, type OpenOrder, getContractConfig } from "@polymarket/clob-client";
+import { config } from "../config";
 import { logger } from "./logger";
+
+/**
+ * The CLOB API returns:
+ *   { balance: string, allowances: Record<spenderAddress, string> }
+ * There is no top-level `allowance` field.
+ */
+function getCollateralAllowanceWei(
+    balanceResponse: any
+): string {
+    const chainId = (config.chainId || Chain.POLYGON) as Chain;
+    const contractConfig = getContractConfig(chainId);
+
+    const allowances: Record<string, string> = balanceResponse?.allowances ?? {};
+    const spender = config.predictiveArb.negRisk ? contractConfig.negRiskExchange : contractConfig.exchange;
+
+    return allowances[spender] ?? "0";
+}
 
 /**
  * Calculate available balance for placing orders
@@ -70,8 +88,8 @@ export async function displayWalletBalance(client: ClobClient): Promise<{ balanc
             asset_type: AssetType.COLLATERAL,
         });
 
-        const balance = parseFloat(balanceResponse.balance || "0");
-        const allowance = parseFloat(balanceResponse.allowance || "0");
+        const balance = parseFloat(balanceResponse.balance || "0") / 10 ** 6;
+        const allowance = parseFloat(getCollateralAllowanceWei(balanceResponse)) / 10 ** 6;
 
         logger.info("═══════════════════════════════════════");
         logger.info("💰 WALLET BALANCE & ALLOWANCE");
@@ -102,7 +120,7 @@ export async function validateBuyOrderBalance(
         });
 
         const balance = parseFloat(balanceResponse.balance || "0") / 10 ** 6;
-        const allowance = parseFloat(balanceResponse.allowance || "0") / 10 ** 6;
+        const allowance = parseFloat(getCollateralAllowanceWei(balanceResponse)) / 10 ** 6;
         const available = (await getAvailableBalance(client, AssetType.COLLATERAL)) / 10 ** 6;
         const valid = available >= requiredAmount;
 
@@ -179,7 +197,7 @@ export async function waitForMinimumUsdcBalance(
             });
 
             const balance = parseFloat(balanceResponse.balance || "0") / 10 ** 6;
-            const allowance = parseFloat(balanceResponse.allowance || "0") / 10 ** 6;
+            const allowance = parseFloat(getCollateralAllowanceWei(balanceResponse)) / 10 ** 6;
             const available = (await getAvailableBalance(client, AssetType.COLLATERAL)) / 10 ** 6;
 
             logger.info("═══════════════════════════════════════");

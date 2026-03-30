@@ -3,11 +3,12 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "start": "tsx src/index.ts",
-    "redeem": "tsx src/redeem.ts",
-    "redeem:holdings": "tsx src/redeem-holdings.ts",
-    "redeem:proxy": "tsx src/redeem-proxy.ts",
-    "test": "tsx --test src/test/limits.test.ts src/test/marketInterval.test.ts"
+    "start": "node --max-old-space-size=8192 ./node_modules/tsx/dist/cli.mjs src/index.ts",
+    "redeem": "node --max-old-space-size=4096 ./node_modules/tsx/dist/cli.mjs src/redeem.ts",
+    "redeem:holdings": "node --max-old-space-size=4096 ./node_modules/tsx/dist/cli.mjs src/redeem-holdings.ts",
+    "redeem:proxy": "node --max-old-space-size=4096 ./node_modules/tsx/dist/cli.mjs src/redeem-proxy.ts",
+    "redeem:auto": "node --max-old-space-size=8192 ./node_modules/tsx/dist/cli.mjs src/auto-redeem.ts",
+    "test": "node --max-old-space-size=4096 ./node_modules/tsx/dist/cli.mjs --test src/test/limits.test.ts src/test/marketInterval.test.ts"
   },
   "keywords": [
     "polymarket",

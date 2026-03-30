@@ -7,6 +7,29 @@ import { Chain, getContractConfig } from "@polymarket/clob-client";
 import { getClobClient } from "../providers/clobclient";
 import { config } from "../config";
 import { logger } from "./logger";
+import { getPolymarketProxyWalletAddress } from "./proxyWallet";
+import {
+    getRedeemCheckpointRow,
+    loadRedeemCheckpoint,
+    pruneRedeemCheckpoint,
+    saveRedeemCheckpoint,
+} from "./redeemCheckpoint";
+
+/**
+ * Address Polymarket attributes positions to and where CTF outcome tokens sit:
+ * EOA by default; Polymarket proxy (or PROZY_WALLET_ADDRESS override) when USE_PROXY_WALLET.
+ */
+async function getConditionalTokenHolderAddress(
+    provider: JsonRpcProvider,
+    chainIdValue: Chain
+): Promise<string> {
+    const wallet = new Wallet(config.requirePrivateKey(), provider);
+    const eoa = await wallet.getAddress();
+    if (!config.useProxyWallet) return eoa;
+    const override = process.env.PROZY_WALLET_ADDRESS?.trim();
+    if (override && /^0x[a-fA-F0-9]{40}$/i.test(override)) return override;
+    return getPolymarketProxyWalletAddress(eoa, chainIdValue);
+}
 
 // CTF Contract ABI - functions needed for redemption and checking resolution
 const CTF_ABI = [
@@ -240,6 +263,8 @@ export interface RedeemOptions {
     indexSets?: number[];
     /** Optional: Chain ID (defaults to Chain.POLYGON) */
     chainId?: Chain;
+    /** Minimal logging (for bot auto-redeem) — cuts string allocation / tee pressure */
+    quiet?: boolean;
 }
 
 /**
@@ -272,6 +297,7 @@ export async function redeemPositions(options: RedeemOptions): Promise<any> {
     const wallet = new Wallet(privateKey, provider);
     
     const address = await wallet.getAddress();
+    const quiet = options.quiet === true;
     
     // Default index sets for Polymarket binary markets: [1, 2] (YES and NO)
     const indexSets = options.indexSets || [1, 2];
@@ -297,12 +323,14 @@ export async function redeemPositions(options: RedeemOptions): Promise<any> {
         wallet
     );
 
-    logger.info("\n=== REDEEMING POSITIONS ===");
-    logger.info(`Condition ID: ${conditionIdBytes32}`);
-    logger.info(`Index Sets: ${indexSets.join(", ")}`);
-    logger.info(`Collateral Token: ${contractConfig.collateral}`);
-    logger.info(`Parent Collection ID: ${parentCollectionId}`);
-    logger.info(`Wallet: ${address}`);
+    if (!quiet) {
+        logger.info("\n=== REDEEMING POSITIONS ===");
+        logger.info(`Condition ID: ${conditionIdBytes32}`);
+        logger.info(`Index Sets: ${indexSets.join(", ")}`);
+        logger.info(`Collateral Token: ${contractConfig.collateral}`);
+        logger.info(`Parent Collection ID: ${parentCollectionId}`);
+        logger.info(`Wallet: ${address}`);
+    }
 
     // Configure gas options
     let gasOptions: { gasPrice?: BigNumber; gasLimit?: number } = {};
@@ -320,8 +348,7 @@ export async function redeemPositions(options: RedeemOptions): Promise<any> {
     }
 
     try {
-        // Call redeemPositions
-        logger.info("Calling redeemPositions on CTF contract...");
+        if (!quiet) logger.info("Calling redeemPositions on CTF contract...");
         const tx = await ctfContract.redeemPositions(
             contractConfig.collateral,
             parentCollectionId,
@@ -330,15 +357,19 @@ export async function redeemPositions(options: RedeemOptions): Promise<any> {
             gasOptions
         );
 
-        logger.info(`Transaction sent: ${tx.hash}`);
-        logger.info("Waiting for confirmation...");
+        if (!quiet) {
+            logger.info(`Transaction sent: ${tx.hash}`);
+            logger.info("Waiting for confirmation...");
+        }
 
         // Wait for transaction to be mined
         const receipt = await tx.wait();
         
-        logger.info(`Transaction confirmed in block ${receipt.blockNumber}`);
-        logger.info(`Gas used: ${receipt.gasUsed.toString()}`);
-        logger.info("\n=== REDEEM COMPLETE ===");
+        if (!quiet) {
+            logger.info(`Transaction confirmed in block ${receipt.blockNumber}`);
+            logger.info(`Gas used: ${receipt.gasUsed.toString()}`);
+            logger.info("\n=== REDEEM COMPLETE ===");
+        }
 
         return receipt;
     } catch (error: any) {
@@ -448,25 +479,46 @@ export async function redeemPositionsDefault(
  * @param maxRetries - Maximum retry attempts for RPC/network errors (default: 3)
  * @returns Transaction receipt
  */
+/** Options for `redeemMarket` (CLI vs bot). */
+export type RedeemMarketOptions = {
+    quiet?: boolean;
+    /**
+     * Trading-bot auto-redeem only: single completed 5m Up/Down pool.
+     * Skips scanning every outcome slot for balances — only indexSets 1 and 2 (binary).
+     * Do not use for multi-outcome markets.
+     */
+    poolRedeemOnly?: boolean;
+    /** Override `retryWithBackoff` initial delay for the final `redeemPositions` tx (ms). */
+    txRetryInitialDelayMs?: number;
+};
+
 export async function redeemMarket(
     conditionId: string,
     chainId?: Chain,
-    maxRetries: number = 3
+    maxRetries: number = 3,
+    redeemOpts?: RedeemMarketOptions
 ): Promise<any> {
     const privateKey = config.requirePrivateKey();
+    const quiet = redeemOpts?.quiet === true;
+    const poolRedeemOnly = redeemOpts?.poolRedeemOnly === true;
 
     const chainIdValue = chainId || ((config.chainId || Chain.POLYGON) as Chain);
-    const contractConfig = getContractConfig(chainIdValue);
-    
+
     // Get RPC URL and create provider
     const { provider, rpcUrl } = await getWorkingProvider(chainIdValue);
     const wallet = new Wallet(privateKey, provider);
-    const walletAddress = await wallet.getAddress();
+    const holderAddress = await getConditionalTokenHolderAddress(provider, chainIdValue);
+    const eoaAddress = await wallet.getAddress();
     
-    logger.info("\n=== CHECKING MARKET RESOLUTION ===");
+    if (!quiet) logger.info("\n=== CHECKING MARKET RESOLUTION ===");
+    if (!quiet && holderAddress.toLowerCase() !== eoaAddress.toLowerCase()) {
+        logger.info(`CTF token holder: ${holderAddress} (signing EOA: ${eoaAddress})`);
+    }
     
     // Check if condition is resolved and get winning outcomes
-    const resolution = await checkConditionResolution(conditionId, chainIdValue);
+    const resolution = await checkConditionResolution(conditionId, chainIdValue, {
+        quiet: quiet || poolRedeemOnly,
+    });
     
     if (!resolution.isResolved) {
         throw new Error(`Market is not yet resolved. ${resolution.reason}`);
@@ -476,11 +528,16 @@ export async function redeemMarket(
         throw new Error("Condition is resolved but no winning outcomes found");
     }
     
-    logger.info(`Winning indexSets: ${resolution.winningIndexSets.join(", ")}`);
+    if (!quiet) logger.info(`Winning indexSets: ${resolution.winningIndexSets.join(", ")}`);
     
     // Get user's token balances for this condition
-    logger.info("Checking your token balances...");
-    const userBalances = await getUserTokenBalances(conditionId, walletAddress, chainIdValue);
+    if (!quiet) logger.info("Checking your token balances...");
+    const userBalances = await getUserTokenBalances(
+        conditionId,
+        holderAddress,
+        chainIdValue,
+        poolRedeemOnly ? { maxIndexSets: 2 } : undefined
+    );
     
     if (userBalances.size === 0) {
         throw new Error("You don't have any tokens for this condition to redeem");
@@ -501,16 +558,20 @@ export async function redeemMarket(
         );
     }
     
-    // Log what will be redeemed
-    logger.info(`\nYou hold winning tokens for indexSets: ${redeemableIndexSets.join(", ")}`);
-    for (const indexSet of redeemableIndexSets) {
-        const balance = userBalances.get(indexSet);
-        logger.info(`  IndexSet ${indexSet}: ${balance?.toString() || "0"} tokens`);
+    if (!quiet) {
+        logger.info(`\nYou hold winning tokens for indexSets: ${redeemableIndexSets.join(", ")}`);
+        for (const indexSet of redeemableIndexSets) {
+            const balance = userBalances.get(indexSet);
+            logger.info(`  IndexSet ${indexSet}: ${balance?.toString() || "0"} tokens`);
+        }
+        logger.info(`\nRedeeming winning positions: ${redeemableIndexSets.join(", ")}`);
     }
     
-    // Redeem only the winning outcomes user holds
-    logger.info(`\nRedeeming winning positions: ${redeemableIndexSets.join(", ")}`);
-    
+    const txRetryInitial =
+        typeof redeemOpts?.txRetryInitialDelayMs === "number" && redeemOpts.txRetryInitialDelayMs >= 0
+            ? redeemOpts.txRetryInitialDelayMs
+            : 2000;
+
     // Use retry logic for redemption (handles RPC/network errors)
     return retryWithBackoff(
         async () => {
@@ -518,10 +579,11 @@ export async function redeemMarket(
                 conditionId,
                 indexSets: redeemableIndexSets,
                 chainId: chainIdValue,
+                quiet,
             });
         },
         maxRetries,
-        2000 // 2 second initial delay, then 4s, 8s
+        txRetryInitial
     );
 }
 
@@ -534,7 +596,8 @@ export async function redeemMarket(
  */
 export async function checkConditionResolution(
     conditionId: string,
-    chainId?: Chain
+    chainId?: Chain,
+    options?: { quiet?: boolean }
 ): Promise<{
     isResolved: boolean;
     winningIndexSets: number[];
@@ -544,6 +607,7 @@ export async function checkConditionResolution(
     reason?: string;
 }> {
     const privateKey = config.requirePrivateKey();
+    const quiet = options?.quiet === true;
 
     const chainIdValue = chainId || ((config.chainId || Chain.POLYGON) as Chain);
     const contractConfig = getContractConfig(chainIdValue);
@@ -592,9 +656,11 @@ export async function checkConditionResolution(
                 }
             }
             
-            logger.info(`Condition resolved. Winning indexSets: ${winningIndexSets.join(", ")}`);
+            if (!quiet) {
+                logger.info(`Condition resolved. Winning indexSets: ${winningIndexSets.join(", ")}`);
+            }
         } else {
-            logger.info("Condition not yet resolved");
+            if (!quiet) logger.info("Condition not yet resolved");
         }
         
         return {
@@ -632,7 +698,9 @@ export async function checkConditionResolution(
 export async function getUserTokenBalances(
     conditionId: string,
     walletAddress: string,
-    chainId?: Chain
+    chainId?: Chain,
+    opts?: { /** Only check index sets 1..max (e.g. 2 for binary Up/Down pool redeem) */
+        maxIndexSets?: number }
 ): Promise<Map<number, BigNumber>> {
     const privateKey = config.requirePrivateKey();
 
@@ -665,9 +733,13 @@ export async function getUserTokenBalances(
     try {
         // Get outcome slot count
         const outcomeSlotCount = (await ctfContract.getOutcomeSlotCount(conditionIdBytes32)).toNumber();
-        
+        const cap =
+            typeof opts?.maxIndexSets === "number" && opts.maxIndexSets > 0
+                ? Math.min(outcomeSlotCount, opts.maxIndexSets)
+                : outcomeSlotCount;
+
         // Check balance for each indexSet (1-indexed)
-        for (let i = 1; i <= outcomeSlotCount; i++) {
+        for (let i = 1; i <= cap; i++) {
             try {
                 // Get collection ID for this indexSet
                 const collectionId = await ctfContract.getCollectionId(
@@ -806,6 +878,7 @@ export async function autoRedeemResolvedMarkets(options: {
     const holdings = getAllHoldings();
     
     const marketIds = Object.keys(holdings);
+    const checkpoint = loadRedeemCheckpoint();
     const results: Array<{
         conditionId: string;
         isResolved: boolean;
@@ -817,16 +890,39 @@ export async function autoRedeemResolvedMarkets(options: {
     let redeemedCount = 0;
     let failedCount = 0;
     
-    logger.info(`\n=== AUTO-REDEEM: Checking ${marketIds.length} markets ===`);
-    
+    const now = Date.now();
+    const DEFAULT_COOLDOWN_MS = 15 * 60 * 1000; // don't re-check every run
+    const MAX_BACKOFF_MS = 6 * 60 * 60 * 1000;
+
+    const toCheck: string[] = [];
     for (const conditionId of marketIds) {
+        const row = checkpoint.markets[conditionId];
+        if (!row) {
+            toCheck.push(conditionId);
+            continue;
+        }
+        // If already redeemed (or intentionally skipped), no need to check again.
+        if (typeof row.lastRedeemedAt === "number") continue;
+        const nextAllowed = typeof row.nextCheckAt === "number" ? row.nextCheckAt : 0;
+        if (nextAllowed > now) continue;
+        const lastChecked = typeof row.lastCheckedAt === "number" ? row.lastCheckedAt : 0;
+        if (lastChecked > 0 && now - lastChecked < DEFAULT_COOLDOWN_MS) continue;
+        toCheck.push(conditionId);
+    }
+
+    logger.info(`\n=== AUTO-REDEEM: Checking ${toCheck.length}/${marketIds.length} markets (checkpoint enabled) ===`);
+    
+    for (const conditionId of toCheck) {
         logger.info(`Checking market: ${conditionId}`);
         try {
+            const row = getRedeemCheckpointRow(checkpoint, conditionId);
+            row.lastCheckedAt = Date.now();
             // Check if market is resolved
             const { isResolved, reason } = await isMarketResolved(conditionId);
             
             if (isResolved) {
                 resolvedCount++;
+                row.lastResolvedAt = Date.now();
                 
                 if (options?.dryRun) {
                     logger.info(`[DRY RUN] Would redeem: ${conditionId}`);
@@ -851,6 +947,8 @@ export async function autoRedeemResolvedMarkets(options: {
                         );
                         
                         redeemedCount++;
+                        row.lastRedeemedAt = Date.now();
+                        row.lastError = undefined;
                         logger.info(`✅ Successfully redeemed ${conditionId}`);
                         
                         // Automatically clear holdings after successful redemption
@@ -872,6 +970,11 @@ export async function autoRedeemResolvedMarkets(options: {
                     } catch (error) {
                         failedCount++;
                         const errorMsg = error instanceof Error ? error.message : String(error);
+                        row.lastError = errorMsg.slice(0, 500);
+                        // Exponential-ish backoff based on how many times we've checked without redeeming.
+                        const prevNext = typeof row.nextCheckAt === "number" ? row.nextCheckAt : 0;
+                        const base = prevNext > now ? (prevNext - now) : DEFAULT_COOLDOWN_MS;
+                        row.nextCheckAt = Date.now() + Math.min(MAX_BACKOFF_MS, Math.max(DEFAULT_COOLDOWN_MS, base * 2));
                         logger.error(`Failed to redeem ${conditionId} after ${maxRetries} attempts`, error);
                         results.push({
                             conditionId,
@@ -883,6 +986,8 @@ export async function autoRedeemResolvedMarkets(options: {
                 }
             } else {
                 logger.info(`Market ${conditionId} not resolved: ${reason}`);
+                row.lastError = (reason || "not_resolved").slice(0, 500);
+                row.nextCheckAt = Date.now() + DEFAULT_COOLDOWN_MS;
                 results.push({
                     conditionId,
                     isResolved: false,
@@ -893,6 +998,9 @@ export async function autoRedeemResolvedMarkets(options: {
         } catch (error) {
             failedCount++;
             const errorMsg = error instanceof Error ? error.message : String(error);
+            const row = getRedeemCheckpointRow(checkpoint, conditionId);
+            row.lastError = errorMsg.slice(0, 500);
+            row.nextCheckAt = Date.now() + DEFAULT_COOLDOWN_MS;
             logger.error(`Error processing ${conditionId}`, error);
             results.push({
                 conditionId,
@@ -901,6 +1009,12 @@ export async function autoRedeemResolvedMarkets(options: {
                 error: errorMsg,
             });
         }
+        if (!options?.dryRun) saveRedeemCheckpoint(checkpoint);
+    }
+
+    if (!options?.dryRun) {
+        pruneRedeemCheckpoint(checkpoint, { maxEntries: 2000, dropOlderThanDays: 30 });
+        saveRedeemCheckpoint(checkpoint);
     }
     
     logger.info(`\n=== AUTO-REDEEM SUMMARY ===`);
@@ -949,6 +1063,66 @@ export interface CurrentPosition {
     negativeRisk: boolean;
 }
 
+const MS_PER_HOUR = 60 * 60 * 1000;
+
+/** Parse Polymarket time fields: ISO strings, unix seconds, or unix ms. */
+export function parseFlexibleMarketTime(raw: string | undefined): number | undefined {
+    if (raw == null) return undefined;
+    const s = String(raw).trim();
+    if (!s) return undefined;
+    if (/^\d+$/.test(s)) {
+        const n = Number(s);
+        if (!Number.isFinite(n)) return undefined;
+        return n < 1e12 ? n * 1000 : n;
+    }
+    const t = Date.parse(s);
+    if (!Number.isNaN(t)) return t;
+    return undefined;
+}
+
+/**
+ * Recurring short markets (e.g. `btc-updown-5m-<unixStart>`) embed the window start in the slug.
+ * Polymarket `endDate` on /positions is often the parent **event** end, not this 5m window — so we
+ * derive actual close as start + 5 minutes when the slug indicates a 5m up/down market.
+ */
+export function slugEmbeddedWindowEndMs(slug: string | undefined): number | undefined {
+    if (!slug) return undefined;
+    if (!/5m|15m|updown/i.test(slug)) return undefined;
+    const matches = slug.match(/\d{10,14}/g);
+    if (!matches || matches.length === 0) return undefined;
+    const last = matches[matches.length - 1];
+    const startSec = Number(last);
+    if (!Number.isFinite(startSec) || startSec < 1e9) return undefined;
+    const durSec = /15m/i.test(slug) ? 15 * 60 : 5 * 60;
+    return (startSec + durSec) * 1000;
+}
+
+/**
+ * Keep a position row for `--pools-within-hours`: uses slug-based 5m window when applicable,
+ * else `endDate`. Missing / unparseable times are **kept** (verified on-chain next).
+ */
+export function positionPassesPoolsWithinHours(p: CurrentPosition, withinHours: number): boolean {
+    if (withinHours <= 0) return true;
+    const cutoff = Date.now() - withinHours * MS_PER_HOUR;
+    const fromSlug = slugEmbeddedWindowEndMs(p.slug);
+    if (fromSlug !== undefined) {
+        return fromSlug >= cutoff;
+    }
+    const t = parseFlexibleMarketTime(p.endDate);
+    if (t === undefined) return true;
+    return t >= cutoff;
+}
+
+/**
+ * endDate-only helper (legacy). Missing / unparseable dates pass through.
+ */
+export function positionEndDateWithinLastHours(endDate: string | undefined, withinHours: number): boolean {
+    if (withinHours <= 0) return true;
+    const t = parseFlexibleMarketTime(endDate);
+    if (t === undefined) return true;
+    return t >= Date.now() - withinHours * MS_PER_HOUR;
+}
+
 /**
  * Get all markets where user has CURRENT/ACTIVE positions using Polymarket data API
  * 
@@ -964,6 +1138,10 @@ export async function getMarketsWithUserPositions(
         walletAddress?: string;
         chainId?: Chain;
         onlyRedeemable?: boolean; // Only return positions that are redeemable (default: false)
+        /** If set and > 0, only positions whose market `endDate` falls in the last N hours (or later) are kept — fewer on-chain balance checks. */
+        poolsEndedWithinHours?: number;
+        /** Suppress routine logs (e.g. trading-bot background sweep). */
+        quiet?: boolean;
     }
 ): Promise<Array<{ conditionId: string; position: CurrentPosition; balances: Map<number, BigNumber> }>> {
     const privateKey = config.requirePrivateKey();
@@ -973,11 +1151,25 @@ export async function getMarketsWithUserPositions(
     // Get RPC URL and create provider
     const { provider, rpcUrl } = await getWorkingProvider(chainIdValue);
     const wallet = new Wallet(privateKey, provider);
-    const walletAddress = options?.walletAddress || await wallet.getAddress();
-    
-    logger.info(`\n=== FINDING YOUR CURRENT/ACTIVE POSITIONS ===`);
-    logger.info(`Wallet: ${walletAddress}`);
-    logger.info(`Using /positions endpoint (returns tokens you currently hold)`);
+    const walletAddress =
+        options?.walletAddress ?? (await getConditionalTokenHolderAddress(provider, chainIdValue));
+    const eoaForLog = await wallet.getAddress();
+    const QPos = options?.quiet === true;
+
+    if (!QPos) {
+        logger.info(`\n=== FINDING YOUR CURRENT/ACTIVE POSITIONS ===`);
+        logger.info(`Positions query / CTF holder: ${walletAddress}`);
+        if (walletAddress.toLowerCase() !== eoaForLog.toLowerCase()) {
+            logger.info(`Signing EOA: ${eoaForLog}`);
+        }
+        logger.info(`Using /positions endpoint (returns tokens you currently hold)`);
+        if (options?.poolsEndedWithinHours != null && options.poolsEndedWithinHours > 0) {
+            logger.info(`Pool time filter: endDate within last ${options.poolsEndedWithinHours} hour(s) (or future)`);
+        }
+        if (options?.onlyRedeemable) {
+            logger.info(`API filter: redeemable=true (Polymarket-marked redeemable positions only)`);
+        }
+    }
     
     const marketsWithPositions: Array<{ conditionId: string; position: CurrentPosition; balances: Map<number, BigNumber> }> = [];
     
@@ -989,7 +1181,12 @@ export async function getMarketsWithUserPositions(
         let offset = 0;
         const limit = 500; // Max per request
         const maxPositions = options?.maxPositions || 1000;
-        
+        const withinH = options?.poolsEndedWithinHours;
+        const applyTimeWhileFetching = typeof withinH === "number" && withinH > 0;
+
+        const balanceScanOpts: { maxIndexSets?: number } | undefined =
+            applyTimeWhileFetching ? { maxIndexSets: 2 } : undefined;
+
         // Fetch all current positions with pagination
         while (allPositions.length < maxPositions) {
             const params = new URLSearchParams({
@@ -1019,9 +1216,37 @@ export async function getMarketsWithUserPositions(
                 if (!Array.isArray(positions) || positions.length === 0) {
                     break; // No more positions
                 }
-                
-                allPositions = [...allPositions, ...positions];
-                logger.info(`Fetched ${allPositions.length} current position(s)...`);
+
+                if (applyTimeWhileFetching) {
+                    let keptThisPage = 0;
+                    for (const p of positions) {
+                        if (allPositions.length >= maxPositions) break;
+                        if (positionPassesPoolsWithinHours(p, withinH)) {
+                            allPositions.push(p);
+                            keptThisPage++;
+                        }
+                    }
+                    if (keptThisPage === 0 && positions.length > 0 && !QPos) {
+                        const samples = positions
+                            .slice(0, 3)
+                            .map((x) => `slug=${x.slug ?? "?"} endDate=${x.endDate ?? "?"}`)
+                            .join(" | ");
+                        logger.warning(
+                            `Pool time filter kept 0/${positions.length} on this page (check --pools-within-hours). Samples: ${samples}`
+                        );
+                    }
+                    if (!QPos) {
+                        logger.info(
+                            `Fetched ${allPositions.length} position(s) in ${withinH}h pool window (slug or endDate, pages until API exhausted)...`
+                        );
+                    }
+                } else {
+                    for (const p of positions) {
+                        if (allPositions.length >= maxPositions) break;
+                        allPositions.push(p);
+                    }
+                    if (!QPos) logger.info(`Fetched ${allPositions.length} current position(s)...`);
+                }
                 
                 // If we got fewer results than the limit, we've reached the end
                 if (positions.length < limit) {
@@ -1034,8 +1259,24 @@ export async function getMarketsWithUserPositions(
                 break;
             }
         }
+
+        if (applyTimeWhileFetching && !QPos) {
+            logger.info(
+                `Pool endDate filter (${withinH}h): kept ${allPositions.length} position row(s) before grouping by market`
+            );
+        }
+
+        if (options?.onlyRedeemable) {
+            const before = allPositions.length;
+            allPositions = allPositions.filter((p) => p.redeemable === true);
+            if (before !== allPositions.length && !QPos) {
+                logger.info(
+                    `Redeemable guard: ${before} → ${allPositions.length} position(s) (dropped non-redeemable rows)`
+                );
+            }
+        }
         
-        logger.info(`\n✅ Found ${allPositions.length} current position(s) from API`);
+        if (!QPos) logger.info(`\n✅ Found ${allPositions.length} current position(s) from API`);
         
         // Group positions by conditionId and verify on-chain balances
         const positionsByMarket = new Map<string, CurrentPosition[]>();
@@ -1048,14 +1289,27 @@ export async function getMarketsWithUserPositions(
             }
         }
         
-        logger.info(`Found ${positionsByMarket.size} unique market(s) with current positions`);
-        logger.info(`\nVerifying on-chain balances...`);
+        if (!QPos) {
+            logger.info(`Found ${positionsByMarket.size} unique market(s) with current positions`);
+            logger.info(`\nVerifying on-chain balances...`);
+        }
         
+        if (balanceScanOpts && !QPos) {
+            logger.info(
+                `On-chain balance scan: indexSets 1–2 only (short-window / binary pools). Use full history without --pools-within-hours for multi-outcome markets.`
+            );
+        }
+
         // For each market, verify on-chain balances
         for (const [conditionId, positions] of positionsByMarket.entries()) {
             try {
                 // Verify user currently has tokens in this market (on-chain check)
-                const userBalances = await getUserTokenBalances(conditionId, walletAddress, chainIdValue);
+                const userBalances = await getUserTokenBalances(
+                    conditionId,
+                    walletAddress,
+                    chainIdValue,
+                    balanceScanOpts
+                );
                 
                 if (userBalances.size > 0) {
                     // User has active positions in this market!
@@ -1066,7 +1320,7 @@ export async function getMarketsWithUserPositions(
                         balances: userBalances 
                     });
                     
-                    if (marketsWithPositions.length % 10 === 0) {
+                    if (!QPos && marketsWithPositions.length % 10 === 0) {
                         logger.info(`Verified ${marketsWithPositions.length} market(s) with active positions...`);
                     }
                 } else {
@@ -1080,11 +1334,11 @@ export async function getMarketsWithUserPositions(
             }
         }
         
-        logger.info(`\n✅ Found ${marketsWithPositions.length} market(s) where you have ACTIVE positions`);
+        if (!QPos) logger.info(`\n✅ Found ${marketsWithPositions.length} market(s) where you have ACTIVE positions`);
         
         // Show redeemable positions if any
         const redeemableCount = allPositions.filter(p => p.redeemable).length;
-        if (redeemableCount > 0) {
+        if (!QPos && redeemableCount > 0) {
             logger.info(`📋 ${redeemableCount} position(s) are marked as redeemable by API`);
         }
         
@@ -1108,6 +1362,7 @@ export async function getRedeemablePositions(
         maxPositions?: number;
         walletAddress?: string;
         chainId?: Chain;
+        poolsEndedWithinHours?: number;
     }
 ): Promise<Array<{ conditionId: string; position: CurrentPosition; balances: Map<number, BigNumber> }>> {
     return getMarketsWithUserPositions({
@@ -1120,6 +1375,10 @@ export async function getRedeemablePositions(
  * Fetch all markets from Polymarket API, find ones where user has positions,
  * and redeem all winning positions
  * This function doesn't rely on token-holding.json - it discovers positions via API + on-chain checks
+ *
+ * When `redeemablePositionsOnly` is omitted: uses Polymarket `redeemable=true` if `poolsEndedWithinHours` is set (>0),
+ * otherwise fetches all positions. Pass `redeemablePositionsOnly: true` to scan every API-redeemable market;
+ * pass `false` to always fetch all positions (even with a time window).
  * 
  * @param options - Options for auto-redemption
  * @returns Summary of redemption results
@@ -1127,6 +1386,21 @@ export async function getRedeemablePositions(
 export async function redeemAllWinningMarketsFromAPI(options?: {
     maxMarkets?: number; // Limit number of markets to check (default: 1000)
     dryRun?: boolean;
+    /**
+     * One-shot run: scan + log what would be redeemed, then submit txs (same process, single API fetch).
+     * Ignored when `dryRun` is true. Use CLI `--full` with `auto-redeem.ts --api`.
+     */
+    previewThenExecute?: boolean;
+    /** Only consider positions whose market endDate is within the last N hours (or future); reduces RPC work. */
+    poolsEndedWithinHours?: number;
+    /**
+     * If true: `/positions?redeemable=true` then optional time filter — whole redeemable set in that window.
+     * If false: never use redeemable API filter.
+     * If omitted: true when `poolsEndedWithinHours` > 0, else false.
+     */
+    redeemablePositionsOnly?: boolean;
+    /** Minimal logging (trading-bot background redeem sweep). */
+    quiet?: boolean;
 }): Promise<{
     totalMarketsChecked: number;
     marketsWithPositions: number;
@@ -1152,16 +1426,36 @@ export async function redeemAllWinningMarketsFromAPI(options?: {
     // Get RPC URL and create provider
     const { provider, rpcUrl } = await getWorkingProvider(chainIdValue);
     const wallet = new Wallet(privateKey, provider);
-    const walletAddress = await wallet.getAddress();
-    
-    const clobClient = await getClobClient();
+    const holderAddress = await getConditionalTokenHolderAddress(provider, chainIdValue);
+    const eoaAddress = await wallet.getAddress();
     
     const maxMarkets = options?.maxMarkets || 1000;
+    const q = options?.quiet === true;
+
+    const explicitRedeemableOnly =
+        options?.redeemablePositionsOnly !== undefined
+            ? options.redeemablePositionsOnly
+            : config.redeem.apiRedeemableOnly;
+    const onlyRedeemableApi =
+        explicitRedeemableOnly === false
+            ? false
+            : explicitRedeemableOnly === true ||
+              (explicitRedeemableOnly !== false &&
+                  typeof options?.poolsEndedWithinHours === "number" &&
+                  options.poolsEndedWithinHours > 0);
     
-    logger.info(`\n=== FETCHING YOUR POSITIONS FROM POLYMARKET API ===`);
-    logger.info(`Wallet: ${walletAddress}`);
-    logger.info(`Max markets to check: ${maxMarkets}`);
-    logger.info(`\nStep 1: Finding markets where you have positions...`);
+    if (!q) {
+        logger.info(`\n=== FETCHING YOUR POSITIONS FROM POLYMARKET API ===`);
+        logger.info(`Positions query / CTF holder: ${holderAddress}`);
+        if (holderAddress.toLowerCase() !== eoaAddress.toLowerCase()) {
+            logger.info(`Signing EOA: ${eoaAddress}`);
+        }
+        logger.info(`Max markets to check: ${maxMarkets}`);
+        logger.info(`API position scope: ${onlyRedeemableApi ? "redeemable only (redeemable=true)" : "all positions"}`);
+        if (options?.poolsEndedWithinHours != null && options.poolsEndedWithinHours > 0) {
+            logger.info(`Pool endDate window: last ${options.poolsEndedWithinHours} hour(s) or future`);
+        }
+    }
     
     const results: Array<{
         conditionId: string;
@@ -1179,19 +1473,31 @@ export async function redeemAllWinningMarketsFromAPI(options?: {
     let withWinningTokensCount = 0;
     let redeemedCount = 0;
     let failedCount = 0;
+
+    type PendingApiRedeem = {
+        conditionId: string;
+        winningHeld: number[];
+        marketTitle: string;
+        winningIndexSets: number[];
+        resultIndex: number;
+    };
+    const pendingRedemptions: PendingApiRedeem[] = [];
+    const previewThenExecute = options?.previewThenExecute === true && options?.dryRun !== true;
     
-    // Step 1: Find all markets where user has positions
-    logger.info(`\nStep 1: Finding markets where you have positions...`);
+    if (!q) logger.info(`\nStep 1: Finding markets where you have positions...`);
     const marketsWithUserPositionsData = await getMarketsWithUserPositions({
         maxPositions: maxMarkets,
-        walletAddress,
+        walletAddress: holderAddress,
         chainId: chainIdValue,
+        poolsEndedWithinHours: options?.poolsEndedWithinHours,
+        onlyRedeemable: onlyRedeemableApi,
+        quiet: q,
     });
     
     marketsWithPositions = marketsWithUserPositionsData.length;
     totalMarketsChecked = marketsWithPositions; // Approximate, actual count is in the function
     
-    logger.info(`\nStep 2: Checking which markets are resolved and if you won...\n`);
+    if (!q) logger.info(`\nStep 2: Checking which markets are resolved and if you won...\n`);
     
     try {
         
@@ -1199,7 +1505,7 @@ export async function redeemAllWinningMarketsFromAPI(options?: {
         for (const { conditionId, position, balances: cachedBalances } of marketsWithUserPositionsData) {
             try {
                 // Check if market is resolved
-                const resolution = await checkConditionResolution(conditionId, chainIdValue);
+                const resolution = await checkConditionResolution(conditionId, chainIdValue, { quiet: q });
                 
                 if (!resolution.isResolved) {
                     // Not resolved yet
@@ -1228,16 +1534,18 @@ export async function redeemAllWinningMarketsFromAPI(options?: {
                     withWinningTokensCount++;
                     
                     const marketTitle = position?.title || conditionId;
-                    logger.info(`\n✅ Found winning market: ${marketTitle}`);
-                    logger.info(`   Condition ID: ${conditionId}`);
-                    logger.info(`   Winning indexSets: ${resolution.winningIndexSets.join(", ")}`);
-                    logger.info(`   Your winning tokens: ${winningHeld.join(", ")}`);
-                    if (position?.redeemable) {
-                        logger.info(`   API marks this as redeemable: ✅`);
+                    if (!q) {
+                        logger.info(`\n✅ Found winning market: ${marketTitle}`);
+                        logger.info(`   Condition ID: ${conditionId}`);
+                        logger.info(`   Winning indexSets: ${resolution.winningIndexSets.join(", ")}`);
+                        logger.info(`   Your winning tokens: ${winningHeld.join(", ")}`);
+                        if (position?.redeemable) {
+                            logger.info(`   API marks this as redeemable: ✅`);
+                        }
                     }
                     
                     if (options?.dryRun) {
-                        logger.info(`[DRY RUN] Would redeem: ${conditionId}`);
+                        if (!q) logger.info(`[DRY RUN] Would redeem: ${conditionId}`);
                         results.push({
                             conditionId,
                             marketTitle,
@@ -1246,24 +1554,42 @@ export async function redeemAllWinningMarketsFromAPI(options?: {
                             redeemed: false,
                             winningIndexSets: resolution.winningIndexSets,
                         });
+                    } else if (previewThenExecute) {
+                        if (!q) logger.info(`[Preview] Queued for on-chain redemption: ${conditionId}`);
+                        const resultIndex = results.length;
+                        results.push({
+                            conditionId,
+                            marketTitle,
+                            isResolved: true,
+                            hasWinningTokens: true,
+                            redeemed: false,
+                            winningIndexSets: resolution.winningIndexSets,
+                        });
+                        pendingRedemptions.push({
+                            conditionId,
+                            winningHeld,
+                            marketTitle,
+                            winningIndexSets: resolution.winningIndexSets,
+                            resultIndex,
+                        });
                     } else {
                         try {
-                            // Redeem winning positions
-                            logger.info(`Redeeming winning positions...`);
+                            if (!q) logger.info(`Redeeming winning positions...`);
                             await redeemPositions({
                                 conditionId,
                                 indexSets: winningHeld,
                                 chainId: chainIdValue,
+                                quiet: q,
                             });
                             
                             redeemedCount++;
-                            logger.info(`✅ Successfully redeemed ${conditionId}`);
+                            if (!q) logger.info(`✅ Successfully redeemed ${conditionId}`);
                             
                             // Automatically clear holdings after successful redemption
                             try {
                                 const { clearMarketHoldings } = await import("./holdings");
                                 clearMarketHoldings(conditionId);
-                                logger.info(`Cleared holdings record for ${conditionId} from token-holding.json`);
+                                if (!q) logger.info(`Cleared holdings record for ${conditionId} from token-holding.json`);
                             } catch (clearError) {
                                 logger.error(`Failed to clear holdings for ${conditionId}: ${clearError instanceof Error ? clearError.message : String(clearError)}`);
                                 // Don't fail the redemption if clearing holdings fails
@@ -1317,18 +1643,65 @@ export async function redeemAllWinningMarketsFromAPI(options?: {
                 });
             }
         }
+
+        if (previewThenExecute && pendingRedemptions.length > 0) {
+            if (!q) {
+                logger.info(
+                    `\n=== EXECUTING ${pendingRedemptions.length} ON-CHAIN REDEMPTION(S) (after preview) ===`
+                );
+            }
+            for (const pr of pendingRedemptions) {
+                try {
+                    if (!q) logger.info(`Redeeming winning positions for ${pr.conditionId}...`);
+                    await redeemPositions({
+                        conditionId: pr.conditionId,
+                        indexSets: pr.winningHeld,
+                        chainId: chainIdValue,
+                        quiet: q,
+                    });
+                    redeemedCount++;
+                    if (!q) logger.info(`✅ Successfully redeemed ${pr.conditionId}`);
+                    const row = results[pr.resultIndex];
+                    if (row) row.redeemed = true;
+                    try {
+                        const { clearMarketHoldings } = await import("./holdings");
+                        clearMarketHoldings(pr.conditionId);
+                        if (!q) logger.info(`Cleared holdings record for ${pr.conditionId} from token-holding.json`);
+                    } catch (clearError) {
+                        logger.error(
+                            `Failed to clear holdings for ${pr.conditionId}: ${clearError instanceof Error ? clearError.message : String(clearError)}`
+                        );
+                    }
+                } catch (error) {
+                    failedCount++;
+                    const errorMsg = error instanceof Error ? error.message : String(error);
+                    logger.error(`Failed to redeem ${pr.conditionId}`, error);
+                    const row = results[pr.resultIndex];
+                    if (row) {
+                        row.redeemed = false;
+                        row.error = errorMsg;
+                    }
+                }
+            }
+        }
         
-        logger.info(`\n=== API REDEMPTION SUMMARY ===`);
-        logger.info(`Total markets checked: ${totalMarketsChecked}`);
-        logger.info(`Markets where you have positions: ${marketsWithPositions}`);
-        logger.info(`Resolved markets: ${resolvedCount}`);
-        logger.info(`Markets with winning tokens: ${withWinningTokensCount}`);
-        if (options?.dryRun) {
-            logger.info(`Would redeem: ${withWinningTokensCount} market(s)`);
+        if (q) {
+            logger.info(
+                `[Redeem API] quiet: checked=${totalMarketsChecked} resolved=${resolvedCount} winners=${withWinningTokensCount} redeemed=${redeemedCount} failed=${failedCount}`
+            );
         } else {
-            logger.info(`Successfully redeemed: ${redeemedCount} market(s)`);
-            if (failedCount > 0) {
-                logger.error(`Failed: ${failedCount} market(s)`);
+            logger.info(`\n=== API REDEMPTION SUMMARY ===`);
+            logger.info(`Total markets checked: ${totalMarketsChecked}`);
+            logger.info(`Markets where you have positions: ${marketsWithPositions}`);
+            logger.info(`Resolved markets: ${resolvedCount}`);
+            logger.info(`Markets with winning tokens: ${withWinningTokensCount}`);
+            if (options?.dryRun) {
+                logger.info(`Would redeem: ${withWinningTokensCount} market(s)`);
+            } else {
+                logger.info(`Successfully redeemed: ${redeemedCount} market(s)`);
+                if (failedCount > 0) {
+                    logger.error(`Failed: ${failedCount} market(s)`);
+                }
             }
         }
         

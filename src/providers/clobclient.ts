@@ -3,7 +3,20 @@ import { Chain, ClobClient } from "@polymarket/clob-client";
 import type { ApiKeyCreds } from "@polymarket/clob-client";
 import { Wallet } from "@ethersproject/wallet";
 import { config } from "../config";
-import { ensureCredential, credentialPath } from "../security/createCredential";
+import { createCredential, ensureCredential, credentialPath } from "../security/createCredential";
+
+function parseCredentialFile(raw: string): ApiKeyCreds {
+    const j = JSON.parse(raw) as Record<string, unknown>;
+    return {
+        key: String(j.key ?? j.apiKey ?? ""),
+        secret: String(j.secret ?? ""),
+        passphrase: String(j.passphrase ?? ""),
+    };
+}
+
+function credentialRecordIsComplete(c: ApiKeyCreds): boolean {
+    return Boolean(c.key && c.secret && c.passphrase);
+}
 
 // Cache for ClobClient instance to avoid repeated initialization
 let cachedClient: ClobClient | null = null;
@@ -14,16 +27,6 @@ let cachedConfig: { chainId: number; host: string } | null = null;
  * If credential file is missing, creates it automatically via createOrDeriveApiKey.
  */
 export async function getClobClient(): Promise<ClobClient> {
-    const chainId = (config.chainId || Chain.POLYGON) as Chain;
-    const host = config.clobApiUrl;
-
-    // Fast path: return cached client without touching disk
-    if (cachedClient && cachedConfig && 
-        cachedConfig.chainId === chainId && 
-        cachedConfig.host === host) {
-        return cachedClient;
-    }
-
     if (!existsSync(credentialPath())) {
         const ok = await ensureCredential();
         if (!ok) {
@@ -33,7 +36,28 @@ export async function getClobClient(): Promise<ClobClient> {
         }
     }
 
-    const creds: ApiKeyCreds = JSON.parse(readFileSync(credentialPath(), "utf-8"));
+    let creds = parseCredentialFile(readFileSync(credentialPath(), "utf-8"));
+    if (!credentialRecordIsComplete(creds)) {
+        // Common failure: partial API response was saved — JSON.stringify omits `undefined`,
+        // so `secret` never made it to disk and `.replace` on secret crashes below.
+        const refreshed = await createCredential();
+        if (!refreshed || !credentialRecordIsComplete(refreshed)) {
+            throw new Error(
+                "src/data/credential.json is missing key, secret, or passphrase. Delete it and restart, or fix CLOB_API_URL / wallet access."
+            );
+        }
+        creds = refreshed;
+    }
+
+    const chainId = (config.chainId || Chain.POLYGON) as Chain;
+    const host = config.clobApiUrl;
+
+    // Return cached client if config hasn't changed
+    if (cachedClient && cachedConfig && 
+        cachedConfig.chainId === chainId && 
+        cachedConfig.host === host) {
+        return cachedClient;
+    }
 
     // Create wallet from private key
     const privateKey = config.requirePrivateKey();

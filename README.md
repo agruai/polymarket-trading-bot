@@ -7,7 +7,7 @@
 
 ## What this bot does
 
-Automated **Polymarket** trading on **5m or 15m Up/Down markets** (configure with `COPYTRADE_MARKET_INTERVAL_MINUTES`). It uses a price predictor to choose direction, places a first-side limit at best ask, then hedges with a second-side limit at `0.98 − firstSidePrice`. Built with TypeScript and Polymarket’s CLOB API.
+Automated **Polymarket** trading on **5m or 15m Up/Down markets** (configure with `COPYTRADE_MARKET_INTERVAL_MINUTES`). It uses a price predictor to choose direction, places a first-side buy at best ask, then hedges with a second-side limit at `hedgePairSum − leg1Price` (default pair cost **0.96** → **~4¢/share** if both legs fill; tunable via `COPYTRADE_HEDGE_*`). Built with TypeScript and Polymarket’s CLOB API.
 
 
 ## Proof of work
@@ -19,7 +19,7 @@ Bot logs from live runs: [logs](https://github.com/CrewSX/polymarket-trading-bot
 
 ## Overview
 
-- **Strategy**: Predict Up/Down from live orderbook via an adaptive price predictor; buy the predicted side at best ask (GTC), then place the opposite side at `0.98 − firstSidePrice` (GTC).
+- **Strategy**: Predict Up/Down from live orderbook; buy the predicted side at best ask, then place the opposite side at `hedgePairSum − leg1Price` (GTC). Optional dynamic adjustment improves edge when leg-1 is expensive and fill rate when leg-1 is cheap.
 - **Markets**: Configurable list (e.g. `btc`, `eth`); slugs are `{market}-updown-{5|15}m-{windowStartUnix}` via Polymarket Gamma API (must match live Polymarket listings).
 - **Stack**: TypeScript, Node (or Bun), `@polymarket/clob-client`, WebSocket orderbook, Ethers.js for allowances/redemption.
 
@@ -55,11 +55,27 @@ cp .env.temp .env
 | `COPYTRADE_MARKET_INTERVAL_MINUTES` | Up/Down window: `5` or `15` | `5` |
 | `COPYTRADE_WAIT_FOR_NEXT_MARKET_START` | Wait for next interval boundary before starting | `false` |
 | `COPYTRADE_MAX_BUY_COUNTS_PER_SIDE` | Max buys per side per market (0 = no cap) | `0` |
+| `COPYTRADE_HEDGE_PAIR_SUM` | Target leg1+leg2 cost (e.g. `0.96` → ~4¢ edge/share) | `0.96` |
+| `COPYTRADE_HEDGE_DYNAMIC_ADJUST` | Adjust pair-sum from leg-1 price (more profit / better fills) | `true` |
+| `COPYTRADE_HEDGE_PROFIT_BIAS` | Extra edge (subtract from pair-sum, e.g. `0.005`) | `0` |
 | `CHAIN_ID` | Chain ID (Polygon) | `137` |
 | `CLOB_API_URL` | Polymarket CLOB API base URL | `https://clob.polymarket.com` |
 | `RPC_URL` / `RPC_TOKEN` | RPC for allowances/redemption | — |
 | `BOT_MIN_USDC_BALANCE` | Min USDC to start | `1` |
 | `LOG_DIR` / `LOG_FILE_PREFIX` | Log directory and file prefix | `logs` / `bot` |
+
+**External BTC spot (Binance, optional)** — polls public `BTCUSDT` to detect short-window momentum. When it aligns with the model’s Up/Down direction on the **`btc` market only**, the bot can lower `COPYTRADE_MIN_CONFIDENCE` and (optionally) skip `COPYTRADE_POOL_TRADE_DELAY_SECS` on strong moves. If the feed is stale or disabled, behavior matches a book-only setup.
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `COPYTRADE_EXTERNAL_SPOT_ENABLED` | `true` to enable | `false` |
+| `COPYTRADE_EXTERNAL_SPOT_POLL_MS` | Poll interval (ms) | `400` |
+| `COPYTRADE_EXTERNAL_SPOT_WINDOW_MS` | Momentum lookback (ms) | `3000` |
+| `COPYTRADE_EXTERNAL_SPOT_BPS_UP` | Min positive bps in window for “spot up” | `8` |
+| `COPYTRADE_EXTERNAL_SPOT_BPS_DOWN` | Min negative bps for “spot down” | `8` |
+| `COPYTRADE_EXTERNAL_SPOT_CONFIDENCE_RELAX` | Subtract from min confidence when aligned | `0.12` |
+| `COPYTRADE_EXTERNAL_SPOT_BYPASS_POOL_DELAY_BPS` | If \|bps\| ≥ this when aligned, skip pool delay (`0` = off) | `0` |
+| `COPYTRADE_EXTERNAL_SPOT_HISTORY_MS` | Sample retention (ms) | `30000` |
 
 API credentials are created on first run and stored in `src/data/credential.json`.
 
@@ -83,6 +99,9 @@ npm run redeem:holdings
 npm run redeem
 # or: bun src/redeem.ts [conditionId] [indexSets...]
 bun src/redeem.ts --check <conditionId>
+
+npm run redeem:auto -- --api --full --pools-within-hours 6 --no-redeemable-filter
+
 ```
 
 **Development**
