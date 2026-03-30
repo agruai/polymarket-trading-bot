@@ -1,5 +1,3 @@
-import { logger } from "./logger";
-
 /**
  * Price prediction result
  */
@@ -121,12 +119,7 @@ export class AdaptivePricePredictor {
      * Returns prediction for next price
      */
     public updateAndPredict(price: number, timestamp: number): PricePrediction | null {
-        const startTime = Date.now();
-        
-        // CRITICAL: Stop predictions if price is outside valid range (0.003 to 0.97)
         if (price < this.minPrice || price > this.maxPrice) {
-            // Price outside valid range - stop predictions until next market
-            // Predictions will resume when reset() is called (new market cycle)
             return null;
         }
         
@@ -137,38 +130,21 @@ export class AdaptivePricePredictor {
             return null;
         }
         
-        // Check ACTUAL price change first (before smoothing) - use raw price for threshold check
-        const actualPriceChange = this.lastAddedPrice !== null 
-            ? Math.abs(price - this.lastAddedPrice)
-            : 0;
-        
-        // CRITICAL: Filter only changes UNDER 0.02 (strictly < 0.02)
-        // Changes >= 0.02 should be considered for prediction
-        if (this.lastAddedPrice !== null && actualPriceChange < this.noiseThreshold) {
-            // Price change too small (< 0.02) - ignore completely, don't make prediction, don't add to history
+        if (this.lastAddedPrice !== null && Math.abs(price - this.lastAddedPrice) < this.noiseThreshold) {
             return null;
         }
         
-        // Update smoothed price using EMA (only if change is significant)
-        this.smoothedPrice = this.smoothingAlpha * price + (1 - this.smoothingAlpha) * (this.smoothedPrice ?? price);
+        this.smoothedPrice = this.smoothingAlpha * price + (1 - this.smoothingAlpha) * this.smoothedPrice;
         
-        // Also check smoothed price is in valid range
         if (this.smoothedPrice < this.minPrice || this.smoothedPrice > this.maxPrice) {
             return null;
         }
         
-        // Use smoothed price change for further processing (but threshold already checked with raw price)
         const smoothedPriceChange = Math.abs(this.smoothedPrice - (this.lastAddedPrice ?? this.smoothedPrice));
         
-        // Only process if change is significant (>= 0.02)
-        // Detect stability (using smoothed change for stability detection)
-        const isStable = smoothedPriceChange < this.noiseThreshold;
-        
-        if (isStable) {
+        if (smoothedPriceChange < this.noiseThreshold) {
             this.stablePriceCount++;
-            if (this.lastStablePrice !== null && Math.abs(this.smoothedPrice - this.lastStablePrice) < 0.001) {
-                // Price is completely stable
-            } else {
+            if (this.lastStablePrice === null || Math.abs(this.smoothedPrice - this.lastStablePrice) >= 0.001) {
                 this.lastStablePrice = this.smoothedPrice;
             }
         } else {
@@ -176,7 +152,6 @@ export class AdaptivePricePredictor {
             this.lastStablePrice = null;
         }
         
-        // Add to ring buffer (change is significant >= 0.02)
         this.ringPush(this.smoothedPrice, timestamp);
         this.lastAddedPrice = this.smoothedPrice;
         
@@ -184,56 +159,35 @@ export class AdaptivePricePredictor {
             return null;
         }
         
-        // Use smoothed price for all calculations
-        const currentSmoothedPrice = this.smoothedPrice ?? price;
-        
-        // Snapshot ring buffer once for the entire call — avoids re-allocating on every access.
+        const currentSmoothedPrice = this.smoothedPrice;
         const prices = this.snapshotPrices();
 
-        // CRITICAL: Only make predictions at pole values (peaks and troughs)
         const isPole = this.detectPole(currentSmoothedPrice, timestamp, prices);
         
-        // If not at a pole, return null - NO PREDICTION
         if (!isPole) {
             return null;
         }
         
-        // Update statistics
         this.updateStatistics(prices);
-        
-        // Calculate features
         const features = this.calculateFeatures(prices);
-        
-        // Make prediction
         const predictedPrice = this.predictPrice(features);
         
-        // Update EMA with smoothed price
         this.updateEMA(currentSmoothedPrice);
         
         if (this.ringLen >= 4) {
             this.learnFromPreviousPrediction(prices);
         }
         
-        // Calculate confidence (use smoothed price)
         const confidence = this.calculateConfidence(features, predictedPrice, currentSmoothedPrice);
-        
-        // Determine direction (compare predicted vs smoothed price) - no neutral, always up or down
         const direction = this.getDirection(predictedPrice, currentSmoothedPrice, features);
-        
-        // Generate signal
         const signal = this.generateSignal(direction, confidence, features);
-        
-        const elapsed = Date.now() - startTime;
-        if (elapsed > 20) {
-            logger.error(`Price prediction took ${elapsed}ms (exceeds 20ms limit)`);
-        }
         
         const prediction: PricePrediction = {
             predictedPrice,
             confidence,
             direction,
             signal,
-            isPoleValue: isPole,
+            isPoleValue: true,
             features: {
                 momentum: features.momentum,
                 volatility: features.volatility,
@@ -241,7 +195,6 @@ export class AdaptivePricePredictor {
             },
         };
         
-        // Store prediction for reuse when not at pole
         this.lastPrediction = prediction;
         
         return prediction;
@@ -382,10 +335,16 @@ export class AdaptivePricePredictor {
         if (n < 3) return 0;
         
         const start = Math.max(0, n - 5);
-        const recentPrices = prices.slice(start);
-        const mean = recentPrices.reduce((a, b) => a + b, 0) / recentPrices.length;
-        const variance = recentPrices.reduce((sum, p) => sum + Math.pow(p - mean, 2), 0) / recentPrices.length;
-        return Math.sqrt(variance);
+        const count = n - start;
+        let sum = 0;
+        for (let i = start; i < n; i++) sum += prices[i];
+        const mean = sum / count;
+        let variance = 0;
+        for (let i = start; i < n; i++) {
+            const d = prices[i] - mean;
+            variance += d * d;
+        }
+        return Math.sqrt(variance / count);
     }
     
     /**
@@ -823,13 +782,19 @@ export class AdaptivePricePredictor {
      * Update price statistics
      */
     private updateStatistics(prices: number[]): void {
-        if (prices.length === 0) return;
-        this.priceMean = prices.reduce((a, b) => a + b, 0) / prices.length;
+        const n = prices.length;
+        if (n === 0) return;
+        let sum = 0;
+        for (let i = 0; i < n; i++) sum += prices[i];
+        this.priceMean = sum / n;
         
-        const variance = prices.reduce((sum, p) => sum + Math.pow(p - this.priceMean, 2), 0) / prices.length;
-        this.priceStd = Math.sqrt(variance);
+        let variance = 0;
+        for (let i = 0; i < n; i++) {
+            const d = prices[i] - this.priceMean;
+            variance += d * d;
+        }
+        this.priceStd = Math.sqrt(variance / n);
         
-        // Prevent division by zero
         if (this.priceStd < 0.001) {
             this.priceStd = 0.1;
         }

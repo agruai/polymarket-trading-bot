@@ -138,11 +138,11 @@ export const config = {
         /** Extra subtract from pair-sum (e.g. 0.005 = 0.5¢ more edge per share if both legs fill). Max 0.03 clamped in code. */
         hedgeProfitBias: envNumber("COPYTRADE_HEDGE_PROFIT_BIAS", 0),
         /** Poll CLOB for leg-1 fill (ms). */
-        leg1FillPollMs: envNumber("COPYTRADE_LEG1_FILL_POLL_MS", 350),
+        leg1FillPollMs: envNumber("COPYTRADE_LEG1_FILL_POLL_MS", 0),
         /** Max polls waiting for leg-1 fill (~poll × attempts ≈ max wait). */
         leg1FillMaxAttempts: envNumber("COPYTRADE_LEG1_FILL_MAX_ATTEMPTS", 50),
         /** Max leg-1 **ask** before skipping (0 = off). High asks → tiny leg-2 limit → poor hedge. */
-        maxLeg1Ask: envNumber("COPYTRADE_MAX_LEG1_ASK", 0.84),
+        maxLeg1Ask: envNumber("COPYTRADE_MAX_LEG1_ASK", 0.58),
         /** Skip if computed leg-2 limit would be below this (0 = off). Avoids unfillable dust hedges. */
         minLeg2Limit: envNumber("COPYTRADE_MIN_LEG2_LIMIT", 0.03),
         /**
@@ -188,6 +188,16 @@ export const config = {
         poolRedeemMaxWaitMs: envNumber("COPYTRADE_POOL_REDEEM_MAX_WAIT_MS", 10 * 60_000),
         /** Initial backoff between on-chain `redeemPositions` attempts after resolution (bot pool path). */
         poolRedeemTxRetryInitialMs: envNumber("COPYTRADE_POOL_REDEEM_TX_RETRY_MS", 800),
+
+        /**
+         * BTC bandwidth gate: at each pool start, fetch the last N minutes of BTC spot prices from Binance.
+         * If (max − min) < threshold, skip trading for the entire pool (low-volatility = choppy/losing conditions).
+         */
+        bandwidthCheckEnabled: envBool("COPYTRADE_BANDWIDTH_CHECK_ENABLED", true),
+        /** USD threshold: pool is tradeable only when BTC bandwidth >= this (default $100). */
+        bandwidthThresholdUsd: envNumber("COPYTRADE_BANDWIDTH_THRESHOLD_USD", 100),
+        /** How many minutes of BTC history to look back for the bandwidth check (default 10). */
+        bandwidthLookbackMinutes: envNumber("COPYTRADE_BANDWIDTH_LOOKBACK_MINUTES", 10),
 
         /** Pool-end exit: sell unhedged leg-1 before expiry when price looks like a loser (stop-loss). */
         exitEnabled: envBool("COPYTRADE_EXIT_ENABLED", true),

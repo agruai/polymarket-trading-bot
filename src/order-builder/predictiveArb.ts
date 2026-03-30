@@ -13,7 +13,7 @@ import {
 } from "../trading/limits";
 import { bumpMetric, maybeLogMetricsSummary } from "../utils/metrics";
 import { isMinuteAtIntervalBoundary, slugForCryptoUpdown, slotStartUnixSeconds } from "../utils/marketInterval";
-import { ExternalSpotFeed } from "../utils/externalSpot";
+import { ExternalSpotFeed, fetchBtcBandwidth } from "../utils/externalSpot";
 
 function parseJsonArray<T>(raw: unknown, ctx: string): T[] {
     if (typeof raw !== "string") throw new Error(`${ctx}: expected JSON string`);
@@ -213,6 +213,9 @@ export class PredictiveArbBot {
 
     /** Binance BTCUSDT momentum (optional); only used when `btc` is in markets and COPYTRADE_EXTERNAL_SPOT_ENABLED. */
     private externalSpotFeed: ExternalSpotFeed | null = null;
+
+    /** Pools where trading is disabled due to low BTC bandwidth (slug → true means disabled). */
+    private poolTradingDisabledBySlug: Set<string> = new Set();
 
     private trimRedeemedConditionIds(): void {
         if (this.redeemedConditionIds.size <= PredictiveArbBot.MAX_REDEEMED_IDS_TRACKED) return;
@@ -424,11 +427,45 @@ export class PredictiveArbBot {
             if (this.wsOrderBook) {
                 this.wireMarketWebSocketFeeds(market, { slug, ...tokenIds });
             }
+
+            await this.runBandwidthCheck(market, slug);
         } catch (e) {
             const errorMsg = e instanceof Error ? e.message : String(e);
             const slug = slugForCryptoUpdown(market, this.cfg.marketIntervalMinutes);
             logger.error(`⚠️  Market ${market} not available yet (${slug}): ${errorMsg}. Will retry on next price update.`);
-            // Don't throw - allow the bot to continue and retry later
+        }
+    }
+
+    /**
+     * At the start of each pool, fetch recent BTC price range from Binance.
+     * If bandwidth (max − min) is below the threshold, disable trading for this pool
+     * to avoid losses in low-volatility / choppy conditions.
+     */
+    private async runBandwidthCheck(market: string, slug: string): Promise<void> {
+        const pa = config.predictiveArb;
+        if (!pa.bandwidthCheckEnabled) return;
+        if (market !== "btc") return;
+
+        try {
+            const result = await fetchBtcBandwidth(pa.bandwidthLookbackMinutes);
+            if (result.stale) {
+                logger.warning(`[Bandwidth] Could not fetch BTC data for ${slug} — trading allowed (fail-open)`);
+                return;
+            }
+
+            if (result.bandwidth < pa.bandwidthThresholdUsd) {
+                this.poolTradingDisabledBySlug.add(slug);
+                logger.info(
+                    `⛔ [Bandwidth] TRADING DISABLED for pool ${slug} | BTC range $${result.bandwidth.toFixed(2)} < $${pa.bandwidthThresholdUsd} threshold (high=$${result.high.toFixed(2)} low=$${result.low.toFixed(2)}, last ${pa.bandwidthLookbackMinutes}min)`
+                );
+            } else {
+                this.poolTradingDisabledBySlug.delete(slug);
+                logger.info(
+                    `✅ [Bandwidth] Trading ENABLED for pool ${slug} | BTC range $${result.bandwidth.toFixed(2)} >= $${pa.bandwidthThresholdUsd} threshold (high=$${result.high.toFixed(2)} low=$${result.low.toFixed(2)}, last ${pa.bandwidthLookbackMinutes}min)`
+                );
+            }
+        } catch (e) {
+            logger.warning(`[Bandwidth] Check failed for ${slug}: ${e instanceof Error ? e.message : String(e)} — trading allowed (fail-open)`);
         }
     }
 
@@ -526,6 +563,8 @@ export class PredictiveArbBot {
 
                 currentTokenIds = { slug, ...newTokenIds };
                 logger.info(`✅ Market ${market} re-initialized with new token IDs`);
+
+                await this.runBandwidthCheck(market, slug);
             } catch (e) {
                 const errorMsg = e instanceof Error ? e.message : String(e);
                 logger.error(`⚠️  Failed to re-initialize market ${market} with new slug ${slug}: ${errorMsg}. Will retry on next price update.`);
@@ -693,6 +732,8 @@ export class PredictiveArbBot {
             const scoreKey = `${market}-${newSlug}`;
             this.marketStartTimeBySlug.set(scoreKey, Date.now());
             logger.info(`✅ Market ${market} re-initialized with new token IDs for cycle ${newSlug}`);
+
+            await this.runBandwidthCheck(market, newSlug);
         } catch (e) {
             const errorMsg = e instanceof Error ? e.message : String(e);
             logger.error(`⚠️  Failed to re-initialize market ${market} with new slug ${newSlug}: ${errorMsg}. Will retry on next check.`);
@@ -710,6 +751,7 @@ export class PredictiveArbBot {
         this.tokenCountsByMarket.delete(prevScoreKey);
         this.pausedMarkets.delete(prevScoreKey);
         this.lastLeg1RoundAt.delete(prevScoreKey);
+        this.poolTradingDisabledBySlug.delete(prevSlug);
         for (const [pid, pos] of this.openPositions) {
             if (pos.scoreKey === prevScoreKey) {
                 this.openPositions.delete(pid);
@@ -1060,6 +1102,10 @@ export class PredictiveArbBot {
         k: string,
         row: SimpleStateRow
     ): Promise<boolean> {
+        if (this.poolTradingDisabledBySlug.has(slug)) {
+            return false;
+        }
+
         const scoreKey = `${market}-${slug}`;
         if (!this.predictionScores.has(scoreKey)) {
             this.predictionScores.set(scoreKey, {

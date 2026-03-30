@@ -14,6 +14,51 @@ export type SpotMomentumSample = {
 };
 
 const BINANCE_URL = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT";
+const BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines";
+
+export type BandwidthResult = {
+    high: number;
+    low: number;
+    bandwidth: number;
+    lookbackMinutes: number;
+    stale: boolean;
+};
+
+/**
+ * Fetch BTC price bandwidth (max − min) over the last `lookbackMinutes` using Binance 1m klines.
+ * Returns the USD range; caller decides whether it exceeds the threshold.
+ */
+export async function fetchBtcBandwidth(lookbackMinutes: number): Promise<BandwidthResult> {
+    const limit = Math.max(1, Math.ceil(lookbackMinutes));
+    const url = `${BINANCE_KLINES_URL}?symbol=BTCUSDT&interval=1m&limit=${limit}`;
+    const ctrl = new AbortController();
+    const tid = setTimeout(() => ctrl.abort(), 8000);
+    try {
+        const res = await fetch(url, { signal: ctrl.signal });
+        if (!res.ok) throw new Error(`Binance klines ${res.status}`);
+        const klines = (await res.json()) as Array<[number, string, string, string, string, ...unknown[]]>;
+        if (!Array.isArray(klines) || klines.length === 0) {
+            return { high: 0, low: 0, bandwidth: 0, lookbackMinutes, stale: true };
+        }
+        let high = -Infinity;
+        let low = Infinity;
+        for (const k of klines) {
+            const h = Number(k[2]);
+            const l = Number(k[3]);
+            if (Number.isFinite(h) && h > high) high = h;
+            if (Number.isFinite(l) && l < low) low = l;
+        }
+        if (!Number.isFinite(high) || !Number.isFinite(low)) {
+            return { high: 0, low: 0, bandwidth: 0, lookbackMinutes, stale: true };
+        }
+        return { high, low, bandwidth: high - low, lookbackMinutes, stale: false };
+    } catch (e) {
+        logger.warning(`[Bandwidth] Failed to fetch BTC klines: ${e instanceof Error ? e.message : String(e)}`);
+        return { high: 0, low: 0, bandwidth: 0, lookbackMinutes, stale: true };
+    } finally {
+        clearTimeout(tid);
+    }
+}
 
 async function fetchBinanceBtcUsdt(): Promise<number> {
     const ctrl = new AbortController();

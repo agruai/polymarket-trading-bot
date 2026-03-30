@@ -34,7 +34,6 @@
     "@ethersproject/units": "^5.8.0",
     "@ethersproject/wallet": "^5.8.0",
     "@polymarket/clob-client": "^5.8.1",
-    "@polymarket/real-time-data-client": "^1.4.0",
     "@types/ws": "^8.18.1",
     "chalk": "^5.6.2",
     "dotenv": "^17.2.3",
