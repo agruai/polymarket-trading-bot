@@ -8,7 +8,8 @@
     "redeem:holdings": "node --max-old-space-size=4096 ./node_modules/tsx/dist/cli.mjs src/redeem-holdings.ts",
     "redeem:proxy": "node --max-old-space-size=4096 ./node_modules/tsx/dist/cli.mjs src/redeem-proxy.ts",
     "redeem:auto": "node --max-old-space-size=8192 ./node_modules/tsx/dist/cli.mjs src/auto-redeem.ts",
-    "test": "node --max-old-space-size=4096 ./node_modules/tsx/dist/cli.mjs --test src/test/limits.test.ts src/test/marketInterval.test.ts"
+    "test": "node --max-old-space-size=4096 ./node_modules/tsx/dist/cli.mjs --test src/test/limits.test.ts src/test/marketInterval.test.ts",
+    "config-ui": "node ./node_modules/tsx/dist/cli.mjs src/config-ui/server.ts"
   },
   "keywords": [
     "polymarket",

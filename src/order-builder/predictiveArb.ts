@@ -11,6 +11,7 @@ import { isMinuteAtIntervalBoundary, slugForCryptoUpdown, slotStartUnixSeconds }
 import { ExternalSpotFeed, fetchBtcBandwidth } from "../utils/externalSpot";
 import type { TradingStrategy, TickContext, BotServices } from "../strategies";
 import { PredictorHedgeStrategy, RuleBasedStrategy } from "../strategies";
+import { writeBotLiveStatus, type BotLiveMarketRow } from "../utils/botLiveStatus";
 
 function parseJsonArray<T>(raw: unknown, ctx: string): T[] {
     if (typeof raw !== "string") throw new Error(`${ctx}: expected JSON string`);
@@ -166,6 +167,9 @@ export class PredictiveArbBot {
     private tradeCompletedSignal: Set<string> = new Set();
     /** Shared services adapter exposed to strategies. */
     private services: BotServices;
+
+    /** Debounced write of `bot-live-status.json` for the config dashboard. */
+    private liveStatusTimer: ReturnType<typeof setTimeout> | null = null;
 
     constructor(private client: ClobClient, private cfg: SimpleConfig) {
         const self = this;
@@ -335,10 +339,17 @@ export class PredictiveArbBot {
         for (const strategy of this.strategies) {
             strategy.start?.();
         }
+
+        setTimeout(() => this.scheduleLiveStatusWrite(), 500);
     }
 
     stop(): void {
         this.isStopped = true;
+        try {
+            this.writeLiveStatusSnapshot();
+        } catch {
+            /* ignore */
+        }
 
         logger.info("\n🛑 Generating final prediction summaries...");
         for (const strategy of this.strategies) {
@@ -730,6 +741,86 @@ export class PredictiveArbBot {
 
         row.previousUpPrice = upAsk;
         saveState(state);
+        this.scheduleLiveStatusWrite();
+    }
+
+    private scheduleLiveStatusWrite(): void {
+        if (this.liveStatusTimer) clearTimeout(this.liveStatusTimer);
+        this.liveStatusTimer = setTimeout(() => {
+            this.liveStatusTimer = null;
+            try {
+                this.writeLiveStatusSnapshot();
+            } catch {
+                /* ignore */
+            }
+        }, 300);
+    }
+
+    private writeLiveStatusSnapshot(): void {
+        const now = Date.now();
+        const poolStartMs = slotStartUnixSeconds(this.cfg.marketIntervalMinutes) * 1000;
+        const intervalMs = this.cfg.marketIntervalMinutes * 60 * 1000;
+        const poolEndMs = poolStartMs + intervalMs;
+        const secsToEnd = (poolEndMs - now) / 1000;
+
+        const markets: BotLiveMarketRow[] = [];
+        for (const market of this.cfg.markets) {
+            const ids = this.tokenIdsByMarket[market];
+            const slug = this.getSlugForMarket(market);
+            const bw = this.poolTradingDisabledBySlug.has(slug);
+
+            if (!ids || !this.wsOrderBook) {
+                let phase: BotLiveMarketRow["poolPhase"] = "waiting";
+                if (secsToEnd <= 0) phase = "ended";
+                markets.push({
+                    market,
+                    slug,
+                    ready: false,
+                    upAsk: null,
+                    downAsk: null,
+                    sum: null,
+                    poolStartMs,
+                    poolEndMs,
+                    secsToEnd,
+                    poolPhase: phase,
+                    bandwidthDisabled: bw,
+                });
+                continue;
+            }
+
+            const up = this.wsOrderBook.getPrice(ids.upTokenId);
+            const down = this.wsOrderBook.getPrice(ids.downTokenId);
+            const ua = up?.bestAsk != null && Number.isFinite(up.bestAsk) ? up.bestAsk : null;
+            const da = down?.bestAsk != null && Number.isFinite(down.bestAsk) ? down.bestAsk : null;
+            const sum = ua != null && da != null ? ua + da : null;
+
+            let phase: BotLiveMarketRow["poolPhase"] = "active";
+            if (secsToEnd <= 0) phase = "ended";
+            else if (ua == null || da == null) phase = "waiting";
+
+            markets.push({
+                market,
+                slug,
+                ready: ua != null && da != null,
+                upAsk: ua,
+                downAsk: da,
+                sum,
+                poolStartMs,
+                poolEndMs,
+                secsToEnd,
+                poolPhase: phase,
+                bandwidthDisabled: bw,
+            });
+        }
+
+        const bal = this.lastKnownBalance;
+        writeBotLiveStatus({
+            updatedAt: new Date().toISOString(),
+            botRunning: !this.isStopped,
+            intervalMinutes: this.cfg.marketIntervalMinutes,
+            balanceUsdcEstimate: Number.isFinite(bal) && bal !== Infinity ? bal : null,
+            markets,
+        });
     }
 
     private getSlugForMarket(market: string): string {
