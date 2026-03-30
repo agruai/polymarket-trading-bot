@@ -219,6 +219,31 @@ export const config = {
         exitSellDiscount: envNumber("COPYTRADE_EXIT_SELL_DISCOUNT", 0.02),
     },
 
+    /**
+     * Rule-based late-pool strategy: near pool end, buy the side that is clearly winning.
+     * Single-leg directional bet (no hedge) — profits when the bought side resolves to $1.
+     * Runs independently of the predictor-based 2-leg strategy.
+     */
+    ruleBasedStrategy: {
+        enabled: envBool("RULE_STRATEGY_ENABLED", false),
+        /** Seconds before pool end to open the entry window (e.g. 30 = start checking at 4:30 in a 5m pool). */
+        entrySecsBeforeEnd: envNumber("RULE_STRATEGY_ENTRY_SECS_BEFORE_END", 30),
+        /** Stop entering this many seconds before pool end (must fill + resolve cleanly). */
+        cutoffSecsBeforeEnd: envNumber("RULE_STRATEGY_CUTOFF_SECS_BEFORE_END", 5),
+        /** Minimum ask-price lead the winning side must have over the losing side (e.g. 0.10 = 10¢ gap). */
+        minPriceLead: envNumber("RULE_STRATEGY_MIN_PRICE_LEAD", 0.10),
+        /** Only buy if the winning side's ask is >= this (avoids buying near 0.50 = coin flip). */
+        minWinnerAsk: envNumber("RULE_STRATEGY_MIN_WINNER_ASK", 0.58),
+        /** Only buy if the winning side's ask is <= this (avoids buying at 0.95+ where edge is tiny). */
+        maxWinnerAsk: envNumber("RULE_STRATEGY_MAX_WINNER_ASK", 0.92),
+        /** Number of shares to buy per rule-based trade. */
+        shares: envNumber("RULE_STRATEGY_SHARES", 5),
+        /** Max rule-based trades per pool (prevents repeated entries if price oscillates). */
+        maxTradesPerPool: envNumber("RULE_STRATEGY_MAX_TRADES_PER_POOL", 1),
+        /** Use GTC limit (ask + tick) vs FAK market order. GTC is default for consistency with leg-1. */
+        useMarketOrder: envBool("RULE_STRATEGY_USE_MARKET_ORDER", false),
+    },
+
     /** Redeem script args via env */
     redeem: {
         conditionId: envString("CONDITION_ID"),
