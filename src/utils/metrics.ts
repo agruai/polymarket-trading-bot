@@ -8,7 +8,8 @@ export const metrics = {
     predictionPoles: 0,
     firstSideOrdersPlaced: 0,
     secondSideOrdersPlaced: 0,
-    secondSideBailouts: 0,
+    poolEndExitSells: 0,
+    ruleBasedBuys: 0,
 };
 
 let lastSummary = Date.now();
@@ -24,6 +25,6 @@ export function maybeLogMetricsSummary(): void {
     if (now - lastSummary < 60_000) return;
     lastSummary = now;
     logger.debug(
-        `metrics: poles=${metrics.predictionPoles} firstSide=${metrics.firstSideOrdersPlaced} secondSide=${metrics.secondSideOrdersPlaced} bailouts=${metrics.secondSideBailouts}`
+        `metrics: poles=${metrics.predictionPoles} firstSide=${metrics.firstSideOrdersPlaced} secondSide=${metrics.secondSideOrdersPlaced} poolExit=${metrics.poolEndExitSells} ruleBased=${metrics.ruleBasedBuys}`
     );
 }

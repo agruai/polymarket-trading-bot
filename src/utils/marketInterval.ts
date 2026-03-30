@@ -39,13 +39,6 @@ export function msUntilNextIntervalBoundary(intervalMinutes: number, now: Date =
     return Math.max(0, d.getTime() - now.getTime());
 }
 
-/** Ms remaining until the current market window closes. */
-export function msUntilSlotEnd(intervalMinutes: number, now: Date = new Date()): number {
-    const startSec = slotStartUnixSeconds(intervalMinutes, now);
-    const endMs = (startSec + intervalMinutes * 60) * 1000;
-    return Math.max(0, endMs - now.getTime());
-}
-
 /** Whether `minutes` is on a boundary for this interval (e.g. 0,5,10… for 5m). */
 export function isMinuteAtIntervalBoundary(minutes: number, intervalMinutes: number): boolean {
     return minutes % intervalMinutes === 0;

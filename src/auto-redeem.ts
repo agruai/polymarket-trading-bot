@@ -10,6 +10,11 @@
  * Usage:
  *   bun src/auto-redeem.ts                    # Check and redeem all resolved markets (from holdings file)
  *   bun src/auto-redeem.ts --api               # Fetch all markets from API and redeem winning positions
+ *   bun src/auto-redeem.ts --api --full --pools-within-hours 6 --no-redeemable-filter   # Preview then redeem in one run (no second CLI)
+ *   bun src/auto-redeem.ts --api --pools-within-hours 6 --no-redeemable-filter   # Recent pools only (avoids OOM on large accounts)
+ *   bun src/auto-redeem.ts --api --pools-within-hours 24   # Redeemable API rows only, endDate in last 24h (or future)
+ *   bun src/auto-redeem.ts --api --redeemable-only         # All Polymarket-marked redeemable positions (no time filter)
+ *   bun src/auto-redeem.ts --api --pools-within-hours 24 --no-redeemable-filter  # Time filter but fetch all position rows from API
  *   bun src/auto-redeem.ts --dry-run          # Check but don't redeem (preview only)
  *   bun src/auto-redeem.ts --clear-holdings   # Clear holdings after successful redemption
  *   bun src/auto-redeem.ts --check <conditionId>  # Check if a specific market is resolved
@@ -100,12 +105,17 @@ async function main() {
     }
     
     // Check for flags
-    const dryRun = args.includes("--dry-run");
-    const clearHoldings = args.includes("--clear-holdings");
     const useAPI = args.includes("--api");
+    /** `--full` only applies with `--api`: preview then redeem in one process (still one API fetch). */
+    const wantsFullApiRedeem = args.includes("--full") && useAPI;
+    const dryRun = args.includes("--dry-run") && !wantsFullApiRedeem;
+    const clearHoldings = args.includes("--clear-holdings");
     
     if (dryRun) {
         logger.info("\n=== DRY RUN MODE: No actual redemptions will be performed ===\n");
+    }
+    if (wantsFullApiRedeem) {
+        logger.info("\n=== --full: preview queued redemptions, then execute on-chain in this run ===\n");
     }
     
     // Use API method if --api flag is set
@@ -116,10 +126,34 @@ async function main() {
         const maxMarkets = args.includes("--max") 
             ? parseInt(args[args.indexOf("--max") + 1]) || 1000
             : 1000;
+
+        const pwhIdx = args.indexOf("--pools-within-hours");
+        const pwhArg = pwhIdx !== -1 ? Number(args[pwhIdx + 1]) : NaN;
+        const poolsEndedWithinHours =
+            Number.isFinite(pwhArg) && pwhArg > 0
+                ? pwhArg
+                : config.redeem.poolsEndedWithinHours > 0
+                  ? config.redeem.poolsEndedWithinHours
+                  : undefined;
+
+        const redeemablePositionsOnly = args.includes("--redeemable-only")
+            ? true
+            : args.includes("--no-redeemable-filter")
+              ? false
+              : undefined;
+
+        if (poolsEndedWithinHours == null) {
+            logger.warning(
+                "No --pools-within-hours (and REDEEM_POOLS_WITHIN_HOURS unset/0): verifying every API market on-chain is slow and may OOM. Example: --api --pools-within-hours 6 --no-redeemable-filter"
+            );
+        }
         
         const result = await redeemAllWinningMarketsFromAPI({
             maxMarkets,
             dryRun,
+            previewThenExecute: wantsFullApiRedeem,
+            poolsEndedWithinHours,
+            redeemablePositionsOnly,
         });
         
         // Print summary
@@ -146,7 +180,9 @@ async function main() {
             for (const res of result.results) {
                 if (res.hasWinningTokens) {
                     const title = res.marketTitle ? `"${res.marketTitle.substring(0, 50)}..."` : res.conditionId.substring(0, 20) + "...";
-                    if (res.redeemed) {
+                    if (dryRun) {
+                        logger.info(`  🔎 ${title} - Would redeem`);
+                    } else if (res.redeemed) {
                         logger.info(`  ✅ ${title} - Redeemed`);
                     } else {
                         logger.error(`  ❌ ${title} - Failed: ${res.error || "Unknown error"}`);

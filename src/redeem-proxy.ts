@@ -142,13 +142,15 @@ async function redeemMarketWithProxy(
     };
 
     // Execute the transaction
-    const gasPrice = parseUnits("100", "gwei"); // 100 gwei
+    // Use a very high gasPrice to avoid EIP-1559 underpricing on Polygon.
+    // (We also add a tx.wait timeout below so we don't wait forever.)
+    const gasPrice = parseUnits("1000000", "gwei");
     const txn = await factory.proxy([proxyTxn], { gasPrice });
     
     logger.info(`Transaction hash: ${txn.hash}`);
     logger.info("Waiting for confirmation...");
     
-    const receipt = await txn.wait();
+    const receipt = await txn.wait(1, 120_000); // 1 confirmation, 2 minute timeout
     
     logger.info(`✅ Successfully redeemed ${conditionId}`);
     logger.info(`Transaction confirmed in block ${receipt.blockNumber}`);
@@ -160,7 +162,6 @@ async function redeemMarketWithProxy(
 async function main() {
     const args = process.argv.slice(2);
     const dryRun = args.includes("--dry-run");
-    const loop = args.includes("--loop") || !args.includes("--once");
     const intervalMs = Number(getArgValue(args, "--interval-ms") ?? "200000"); // 15m
     const maxRetries = Number(getArgValue(args, "--max-retries") ?? "3");
     const initialDelayMs = Number(getArgValue(args, "--initial-delay-ms") ?? "200000"); // 200s
@@ -183,6 +184,13 @@ async function main() {
     const singleConditionId = conditionIdArg 
         ? conditionIdArg.split("=")[1] 
         : config.redeem.conditionId || process.env.CONDITION_ID;
+
+    // Default behavior:
+    // - If user gave a single --condition-id, run once and exit unless --loop was explicitly requested.
+    // - For holdings-file mode (no singleConditionId), loop unless --once is passed.
+    const wantsLoop = args.includes("--loop");
+    const wantsOnce = args.includes("--once");
+    const loop = wantsOnce ? false : singleConditionId ? wantsLoop : true;
 
     let running = false;
     const runOnce = async () => {

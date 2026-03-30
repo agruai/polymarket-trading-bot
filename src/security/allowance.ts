@@ -8,6 +8,7 @@ import { Chain, AssetType, ClobClient } from "@polymarket/clob-client";
 import { getContractConfig } from "@polymarket/clob-client";
 import { logger } from "../utils/logger";
 import { config } from "../config";
+import { getPolymarketProxyWalletAddress } from "../utils/proxyWallet";
 
 // Minimal USDC ERC20 ABI
 const USDC_ABI = [
@@ -145,6 +146,22 @@ export async function approveUSDCAllowance(): Promise<void> {
         logger.info("✅ USDC approved for Exchange contract");
     } else {
         logger.info("✅ USDC already approved for Exchange contract (MaxUint256)");
+    }
+
+    // The Polymarket CLOB balance/allowance gate effectively expects approval to the Polymarket proxy wallet
+    // derived from this EOA. Approving ConditionalTokens/exchange alone may still leave allowance=0.
+    const proxyWalletAddress = await getPolymarketProxyWalletAddress(address, chainId);
+    logger.info(`Polymarket proxy wallet: ${proxyWalletAddress}`);
+
+    const proxyAllowance = await usdcContract.allowance(address, proxyWalletAddress);
+    if (!proxyAllowance.eq(MaxUint256)) {
+        logger.info(`Current ProxyWallet allowance: ${proxyAllowance.toString()}, setting to MaxUint256...`);
+        const tx = await usdcContract.approve(proxyWalletAddress, MaxUint256, gasOptions);
+        logger.info(`Transaction hash: ${tx.hash}`);
+        await tx.wait();
+        logger.info("✅ USDC approved for Polymarket proxy wallet");
+    } else {
+        logger.info("✅ USDC already approved for Polymarket proxy wallet (MaxUint256)");
     }
 
     // Check and approve ConditionalTokens (ERC1155) for Exchange contract

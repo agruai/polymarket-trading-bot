@@ -15,6 +15,40 @@ export function hasCredentialFile(): boolean {
     return existsSync(CREDENTIAL_PATH);
 }
 
+function isCompleteApiKeyCreds(c: ApiKeyCreds | null | undefined): boolean {
+    return Boolean(
+        c &&
+            typeof c.key === "string" &&
+            c.key.length > 0 &&
+            typeof c.secret === "string" &&
+            c.secret.length > 0 &&
+            typeof c.passphrase === "string" &&
+            c.passphrase.length > 0
+    );
+}
+
+/**
+ * Polymarket may return a partial object from createApiKey (e.g. key set but secret missing).
+ * createOrDeriveApiKey only falls back to derive when `!response.key`, not when secret is absent.
+ * We explicitly recover via deriveApiKey so credential.json always contains a full triple.
+ */
+async function fetchCompleteApiKeyCreds(clobClient: ClobClient): Promise<ApiKeyCreds> {
+    let credential = await clobClient.createOrDeriveApiKey();
+    if (isCompleteApiKeyCreds(credential)) return credential;
+
+    logger.warning("API key response was incomplete; trying deriveApiKey()…");
+    credential = await clobClient.deriveApiKey();
+    if (isCompleteApiKeyCreds(credential)) return credential;
+
+    logger.warning("deriveApiKey still incomplete; trying createApiKey()…");
+    credential = await clobClient.createApiKey();
+    if (isCompleteApiKeyCreds(credential)) return credential;
+
+    throw new Error(
+        "Polymarket did not return a complete API key (key, secret, passphrase). Check network / CLOB_API_URL and try again."
+    );
+}
+
 /**
  * Create API key credentials via createOrDeriveApiKey and save to src/data/credential.json.
  * Ensures src/data directory exists before writing.
@@ -31,7 +65,7 @@ export async function createCredential(): Promise<ApiKeyCreds | null> {
 
         // Create temporary ClobClient (no API key) and derive/create API key
         const clobClient = new ClobClient(host, chainId, wallet);
-        const credential = await clobClient.createOrDeriveApiKey();
+        const credential = await fetchCompleteApiKeyCreds(clobClient);
         await saveCredential(credential);
 
         logger.info("Credential created successfully");

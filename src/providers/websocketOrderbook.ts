@@ -1,11 +1,14 @@
 import WebSocket from "ws";
 import { logger } from "../utils/logger";
+import { config } from "../config";
 import type { ApiKeyCreds } from "@polymarket/clob-client";
 
 const MARKET_CHANNEL = "market";
 const USER_CHANNEL = "user";
 const WS_URL = "wss://ws-subscriptions-clob.polymarket.com";
 const PING_INTERVAL_MS = 10000; // 10 seconds
+/** Throttle noisy per-tick ask logs (each line allocates strings + chalk + file I/O). */
+const ASK_INFO_LOG_MIN_INTERVAL_MS = 15_000;
 
 export interface OrderBookLevel {
     price: string;
@@ -38,6 +41,8 @@ export class WebSocketOrderBook {
     public subscribedAssetIds: Set<string> = new Set();
     private tokenLabels: Map<string, string> = new Map();
     private lastLoggedAsk: Map<string, number> = new Map(); // Throttle per-tick logging
+    /** Wall-clock throttle for ask info lines (memory / disk). */
+    private lastAskInfoLogAt: Map<string, number> = new Map();
     private reconnectAttempts = 0;
     private maxReconnectAttempts = 20;
     private readonly baseReconnectDelayMs = 500;
@@ -132,6 +137,7 @@ export class WebSocketOrderBook {
             this.tokenPrices.delete(id);
             this.tokenLabels.delete(id);
             this.lastLoggedAsk.delete(id);
+            this.lastAskInfoLogAt.delete(id);
         }
         this.unsubscribeFromTokenIds(ids);
     }
@@ -145,6 +151,8 @@ export class WebSocketOrderBook {
             return;
         }
 
+        const drop = new Set(assetIds);
+        this.assetIds = this.assetIds.filter((id) => !drop.has(id));
         assetIds.forEach(id => this.subscribedAssetIds.delete(id));
 
         if (this.isConnected && this.ws?.readyState === WebSocket.OPEN) {
@@ -165,6 +173,16 @@ export class WebSocketOrderBook {
         return new Promise((resolve, reject) => {
             const fullUrl = `${this.url}/ws/${this.channelType}`;
             logger.info(`Connecting to WebSocket: ${fullUrl}`);
+
+            if (this.ws) {
+                try {
+                    this.ws.removeAllListeners();
+                    this.ws.close();
+                } catch {
+                    // ignore
+                }
+                this.ws = null;
+            }
 
             this.ws = new WebSocket(fullUrl);
 
@@ -263,24 +281,19 @@ export class WebSocketOrderBook {
      */
     private handleMessage(data: WebSocket.Data): void {
         try {
-            // Fast PING/PONG detection: check buffer length before full string decode
-            if (Buffer.isBuffer(data)) {
-                if (data.length === 4 && data[0] === 0x50 && data[1] === 0x49 && data[2] === 0x4E && data[3] === 0x47) {
-                    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send("PONG");
-                    return;
-                }
-                if (data.length === 4 && data[0] === 0x50 && data[1] === 0x4F && data[2] === 0x4E && data[3] === 0x47) {
-                    return;
-                }
-            }
-
             const message = data.toString();
 
+            // Handle ping/pong (fast path)
             if (message === "PING") {
-                if (this.ws?.readyState === WebSocket.OPEN) this.ws.send("PONG");
+                if (this.ws?.readyState === WebSocket.OPEN) {
+                    this.ws.send("PONG");
+                }
                 return;
             }
-            if (message === "PONG") return;
+
+            if (message === "PONG") {
+                return; // Server acknowledged ping
+            }
 
             const parsed = JSON.parse(message);
 
@@ -355,31 +368,40 @@ export class WebSocketOrderBook {
         // Use timestamp from message if available, otherwise use current time
         const timestamp = message.timestamp ? parseInt(message.timestamp, 10) : Date.now();
 
-        // Log ask price only when it actually changed (avoid flooding logs)
+        // Avoid flooding logs: each line allocates strings + chalk + tee'd file buffers — major OOM risk at WS rates.
         if (bestAsk !== null) {
             const prev = this.lastLoggedAsk.get(assetId);
             if (prev === undefined || Math.abs(bestAsk - prev) >= 0.0001) {
                 this.lastLoggedAsk.set(assetId, bestAsk);
-                const label = this.tokenLabels.get(assetId) || "Unknown";
-                if (label === "Up")
-                    logger.info(`📊 ${label} Ask ==========> ${bestAsk.toFixed(4)}`);
-                else if (label === "Down")
-                    logger.info(`📊 ${label} Ask ${bestAsk.toFixed(4)}`);
+                const now = Date.now();
+                const lastLog = this.lastAskInfoLogAt.get(assetId) ?? 0;
+                // Order-book tick logs are extremely noisy (memory). Off unless LOG_PREDICTIONS=true.
+                const allowVerbose =
+                    config.logPredictions &&
+                    (config.debug || now - lastLog >= ASK_INFO_LOG_MIN_INTERVAL_MS);
+                if (allowVerbose) {
+                    this.lastAskInfoLogAt.set(assetId, now);
+                    const label = this.tokenLabels.get(assetId) || "Unknown";
+                    if (label === "Up")
+                        logger.info(`📊 ${label} Ask ==========> ${bestAsk.toFixed(4)}`);
+                    else if (label === "Down")
+                        logger.info(`📊 ${label} Ask ${bestAsk.toFixed(4)}`);
+                }
             }
         }
 
-        // Reuse cached TokenPrice object to avoid allocation per tick
-        let price = this.tokenPrices.get(assetId);
-        if (price) {
-            price.bestBid = bestBid;
-            price.bestAsk = bestAsk;
-            price.mid = mid;
-            price.timestamp = timestamp;
-        } else {
-            price = { tokenId: assetId, bestBid, bestAsk, mid, timestamp };
-            this.tokenPrices.set(assetId, price);
-        }
+        const price: TokenPrice = {
+            tokenId: assetId,
+            bestBid,
+            bestAsk,
+            mid,
+            timestamp,
+        };
 
+        // Update cache (fast Map operation)
+        this.tokenPrices.set(assetId, price);
+
+        // Notify callback if exists (avoid Map lookup if no callback)
         const callback = this.priceCallbacks.get(assetId);
         if (callback) {
             callback(assetId, price);
@@ -478,7 +500,3 @@ export class WebSocketOrderBook {
         return this.isConnected && this.ws?.readyState === WebSocket.OPEN;
     }
 }
-
-// Import config for debug flag
-import { config } from "../config";
-

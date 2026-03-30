@@ -1,5 +1,3 @@
-import { logger } from "./logger";
-
 /**
  * Price prediction result
  */
@@ -77,20 +75,13 @@ export class AdaptivePricePredictor {
     // Recent accuracy tracking (sliding window for better adaptation)
     private recentPredictions: Array<{ correct: boolean; confidence: number }> = [];
     private readonly recentWindowSize = 20; // Track last 20 predictions
-    // Running counters to avoid filter/reduce on every confidence calc
-    private recentCorrectCount = 0;
-    private recentHighConfCount = 0;       // confidence >= 0.80
-    private recentHighConfCorrectCount = 0;
     
     // EMA for trend - using shorter periods for faster response
     private emaShort = 0.5; // Fast EMA (2 periods) - faster response
     private emaLong = 0.5; // Slow EMA (5 periods) - medium response
     private readonly alphaShort = 2 / (2 + 1); // Faster EMA
     private readonly alphaLong = 2 / (5 + 1); // Medium EMA
-    private poleHistory: Array<{ price: number; type: "peak" | "trough"; timestamp: number }> = new Array(10);
-    private poleHistoryLen = 0;
-    private poleHistoryHead = 0;
-    private readonly poleHistoryMax = 10;
+    private poleHistory: Array<{ price: number; type: "peak" | "trough"; timestamp: number }> = [];
     private lastPolePrice: number | null = null;
     private lastPoleType: "peak" | "trough" | null = null;
     private lastPrediction: PricePrediction | null = null; // Store last prediction for pole-based updates
@@ -99,9 +90,6 @@ export class AdaptivePricePredictor {
     // Price range limits - stop predictions outside this range
     private readonly minPrice = 0.003;
     private readonly maxPrice = 0.97;
-
-    // Pre-allocated scratch buffer for snapshotPrices — avoids GC on hot path
-    private snapshotBuf: number[] = new Array(10).fill(0);
 
     /** Push a value into the ring buffer. O(1). */
     private ringPush(price: number, ts: number): void {
@@ -119,26 +107,11 @@ export class AdaptivePricePredictor {
         return this.priceRing[(start + i) % this.maxHistorySize];
     }
 
-    /** Fill the reusable snapshot buffer with prices in chronological order. Returns a view of length ringLen. */
+    /** Snapshot of prices in chronological order (oldest first). Allocates a new array each call. */
     private snapshotPrices(): number[] {
-        const start = this.ringLen < this.maxHistorySize ? 0 : this.ringHead;
-        for (let i = 0; i < this.ringLen; i++) {
-            this.snapshotBuf[i] = this.priceRing[(start + i) % this.maxHistorySize];
-        }
-        // Return a fixed-length view; callers use the known ringLen
-        return this.snapshotBuf;
-    }
-
-    /** Push to the fixed-size pole history ring. O(1) — no shift(). */
-    private polePush(price: number, type: "peak" | "trough", timestamp: number): void {
-        const entry = this.poleHistory[this.poleHistoryHead];
-        if (entry) {
-            entry.price = price; entry.type = type; entry.timestamp = timestamp;
-        } else {
-            this.poleHistory[this.poleHistoryHead] = { price, type, timestamp };
-        }
-        this.poleHistoryHead = (this.poleHistoryHead + 1) % this.poleHistoryMax;
-        if (this.poleHistoryLen < this.poleHistoryMax) this.poleHistoryLen++;
+        const out: number[] = new Array(this.ringLen);
+        for (let i = 0; i < this.ringLen; i++) out[i] = this.ringAt(i);
+        return out;
     }
     
     /**
@@ -146,12 +119,7 @@ export class AdaptivePricePredictor {
      * Returns prediction for next price
      */
     public updateAndPredict(price: number, timestamp: number): PricePrediction | null {
-        const startTime = Date.now();
-        
-        // CRITICAL: Stop predictions if price is outside valid range (0.003 to 0.97)
         if (price < this.minPrice || price > this.maxPrice) {
-            // Price outside valid range - stop predictions until next market
-            // Predictions will resume when reset() is called (new market cycle)
             return null;
         }
         
@@ -162,38 +130,21 @@ export class AdaptivePricePredictor {
             return null;
         }
         
-        // Check ACTUAL price change first (before smoothing) - use raw price for threshold check
-        const actualPriceChange = this.lastAddedPrice !== null 
-            ? Math.abs(price - this.lastAddedPrice)
-            : 0;
-        
-        // CRITICAL: Filter only changes UNDER 0.02 (strictly < 0.02)
-        // Changes >= 0.02 should be considered for prediction
-        if (this.lastAddedPrice !== null && actualPriceChange < this.noiseThreshold) {
-            // Price change too small (< 0.02) - ignore completely, don't make prediction, don't add to history
+        if (this.lastAddedPrice !== null && Math.abs(price - this.lastAddedPrice) < this.noiseThreshold) {
             return null;
         }
         
-        // Update smoothed price using EMA (only if change is significant)
-        this.smoothedPrice = this.smoothingAlpha * price + (1 - this.smoothingAlpha) * (this.smoothedPrice ?? price);
+        this.smoothedPrice = this.smoothingAlpha * price + (1 - this.smoothingAlpha) * this.smoothedPrice;
         
-        // Also check smoothed price is in valid range
         if (this.smoothedPrice < this.minPrice || this.smoothedPrice > this.maxPrice) {
             return null;
         }
         
-        // Use smoothed price change for further processing (but threshold already checked with raw price)
         const smoothedPriceChange = Math.abs(this.smoothedPrice - (this.lastAddedPrice ?? this.smoothedPrice));
         
-        // Only process if change is significant (>= 0.02)
-        // Detect stability (using smoothed change for stability detection)
-        const isStable = smoothedPriceChange < this.noiseThreshold;
-        
-        if (isStable) {
+        if (smoothedPriceChange < this.noiseThreshold) {
             this.stablePriceCount++;
-            if (this.lastStablePrice !== null && Math.abs(this.smoothedPrice - this.lastStablePrice) < 0.001) {
-                // Price is completely stable
-            } else {
+            if (this.lastStablePrice === null || Math.abs(this.smoothedPrice - this.lastStablePrice) >= 0.001) {
                 this.lastStablePrice = this.smoothedPrice;
             }
         } else {
@@ -201,7 +152,6 @@ export class AdaptivePricePredictor {
             this.lastStablePrice = null;
         }
         
-        // Add to ring buffer (change is significant >= 0.02)
         this.ringPush(this.smoothedPrice, timestamp);
         this.lastAddedPrice = this.smoothedPrice;
         
@@ -209,57 +159,35 @@ export class AdaptivePricePredictor {
             return null;
         }
         
-        // Use smoothed price for all calculations
-        const currentSmoothedPrice = this.smoothedPrice ?? price;
-        
-        // Fill reusable snapshot buffer — zero allocation on hot path
+        const currentSmoothedPrice = this.smoothedPrice;
         const prices = this.snapshotPrices();
-        const n = this.ringLen;
 
-        // CRITICAL: Only make predictions at pole values (peaks and troughs)
-        const isPole = this.detectPole(currentSmoothedPrice, timestamp, prices, n);
+        const isPole = this.detectPole(currentSmoothedPrice, timestamp, prices);
         
-        // If not at a pole, return null - NO PREDICTION
         if (!isPole) {
             return null;
         }
         
-        // Update statistics
-        this.updateStatistics(prices, n);
-        
-        // Calculate features
-        const features = this.calculateFeatures(prices, n);
-        
-        // Make prediction
+        this.updateStatistics(prices);
+        const features = this.calculateFeatures(prices);
         const predictedPrice = this.predictPrice(features);
         
-        // Update EMA with smoothed price
         this.updateEMA(currentSmoothedPrice);
         
         if (this.ringLen >= 4) {
-            this.learnFromPreviousPrediction(prices, n);
+            this.learnFromPreviousPrediction(prices);
         }
         
-        // Calculate confidence (use smoothed price)
         const confidence = this.calculateConfidence(features, predictedPrice, currentSmoothedPrice);
-        
-        // Determine direction (compare predicted vs smoothed price) - no neutral, always up or down
         const direction = this.getDirection(predictedPrice, currentSmoothedPrice, features);
-        
-        // Generate signal
         const signal = this.generateSignal(direction, confidence, features);
-        
-        const elapsed = Date.now() - startTime;
-        if (elapsed > 20) {
-            logger.error(`Price prediction took ${elapsed}ms (exceeds 20ms limit)`);
-        }
         
         const prediction: PricePrediction = {
             predictedPrice,
             confidence,
             direction,
             signal,
-            isPoleValue: isPole,
+            isPoleValue: true,
             features: {
                 momentum: features.momentum,
                 volatility: features.volatility,
@@ -267,7 +195,6 @@ export class AdaptivePricePredictor {
             },
         };
         
-        // Store prediction for reuse when not at pole
         this.lastPrediction = prediction;
         
         return prediction;
@@ -277,52 +204,75 @@ export class AdaptivePricePredictor {
      * Detect pole values (local peaks and troughs)
      * Returns true if current price is at a pole (peak or trough)
      */
-    private detectPole(currentPrice: number, timestamp: number, prices: number[], n: number): boolean {
-        if (n < 3) return false;
+    private detectPole(currentPrice: number, timestamp: number, prices: number[]): boolean {
+        if (prices.length < 3) {
+            return false;
+        }
         
+        const n = prices.length;
         const centerIdx = n - 1;
         const centerPrice = prices[centerIdx];
         
-        if (centerIdx < 2) return false;
-        
-        let isPeak = true;
-        let isTrough = true;
-        
-        const lookback = Math.min(3, centerIdx);
-        for (let i = centerIdx - lookback; i < centerIdx; i++) {
-            const p = prices[i];
-            if (p >= centerPrice) isPeak = false;
-            if (p <= centerPrice) isTrough = false;
+        // Check if current price is a local peak (higher than previous prices)
+        // or trough (lower than previous prices)
+        if (centerIdx >= 2) {
+            let isPeak = true;
+            let isTrough = true;
+            
+            // Check at least 2 previous prices
+            const lookback = Math.min(3, centerIdx);
+            for (let i = centerIdx - lookback; i < centerIdx; i++) {
+                const price = prices[i];
+                // For peak: all previous prices must be strictly lower
+                if (price >= centerPrice) isPeak = false;
+                // For trough: all previous prices must be strictly higher
+                if (price <= centerPrice) isTrough = false;
+            }
+            
+            // Check if this is a pole (peak or trough)
+            if (isPeak || isTrough) {
+                // Check if change from last pole is significant (> 0.019)
+                if (this.lastPolePrice === null) {
+                    // First pole - always accept
+                    this.lastPolePrice = centerPrice;
+                    this.lastPoleType = isPeak ? "peak" : "trough";
+                    this.lastPoleTimestamp = timestamp;
+                    this.poleHistory.push({ price: centerPrice, type: this.lastPoleType, timestamp });
+                    if (this.poleHistory.length > 10) {
+                        this.poleHistory.shift();
+                    }
+                    return true;
+                } else {
+                    // Check if change from last pole is significant (>= 0.02)
+                    const changeFromLastPole = Math.abs(centerPrice - this.lastPolePrice);
+                    // Also check if this is a different type of pole (peak vs trough)
+                    const isDifferentPoleType = (isPeak && this.lastPoleType === "trough") || 
+                                                (isTrough && this.lastPoleType === "peak");
+                    
+                    if (changeFromLastPole >= this.noiseThreshold || isDifferentPoleType) {
+                        // Significant change OR different pole type - this is a new pole
+                        this.lastPolePrice = centerPrice;
+                        this.lastPoleType = isPeak ? "peak" : "trough";
+                        this.lastPoleTimestamp = timestamp;
+                        this.poleHistory.push({ price: centerPrice, type: this.lastPoleType, timestamp });
+                        if (this.poleHistory.length > 10) {
+                            this.poleHistory.shift();
+                        }
+                        return true;
+                    }
+                    // Change too small from last pole - not a new pole
+                    return false;
+                }
+            }
         }
         
-        if (!isPeak && !isTrough) return false;
-        
-        if (this.lastPolePrice === null) {
-            this.lastPolePrice = centerPrice;
-            this.lastPoleType = isPeak ? "peak" : "trough";
-            this.lastPoleTimestamp = timestamp;
-            this.polePush(centerPrice, this.lastPoleType, timestamp);
-            return true;
-        }
-        
-        const changeFromLastPole = Math.abs(centerPrice - this.lastPolePrice);
-        const isDifferentPoleType = (isPeak && this.lastPoleType === "trough") || 
-                                    (isTrough && this.lastPoleType === "peak");
-        
-        if (changeFromLastPole >= this.noiseThreshold || isDifferentPoleType) {
-            this.lastPolePrice = centerPrice;
-            this.lastPoleType = isPeak ? "peak" : "trough";
-            this.lastPoleTimestamp = timestamp;
-            this.polePush(centerPrice, this.lastPoleType, timestamp);
-            return true;
-        }
-        return false;
+        return false; // Not at a pole
     }
     
     /**
      * Calculate features from price history
      */
-    private calculateFeatures(prices: number[], n: number): {
+    private calculateFeatures(prices: number[]): {
         priceLag1: number;
         priceLag2: number;
         priceLag3: number;
@@ -330,23 +280,43 @@ export class AdaptivePricePredictor {
         volatility: number;
         trend: number;
     } {
+        const n = prices.length;
         const currentPrice = prices[n - 1];
         const priceLag1 = n >= 2 ? prices[n - 2] : currentPrice;
         const priceLag2 = n >= 3 ? prices[n - 3] : priceLag1;
         const priceLag3 = n >= 4 ? prices[n - 4] : priceLag2;
         
+        // Momentum: rate of price change (using smoothed prices, so already noise-filtered)
+        // Calculate momentum over longer period to reduce noise sensitivity
         const priceChange = currentPrice - priceLag1;
-        let effectiveMomentum = priceLag1 > 0 ? priceChange / priceLag1 : 0;
+        const momentum = priceLag1 > 0 ? priceChange / priceLag1 : 0;
         
+        // Additional momentum check: compare with earlier price for trend confirmation
         if (n >= 4) {
             const longerTermChange = currentPrice - priceLag2;
+            // If short-term and long-term momentum agree, use average (stronger signal)
             if ((priceChange > 0 && longerTermChange > 0) || (priceChange < 0 && longerTermChange < 0)) {
-                effectiveMomentum = (effectiveMomentum + (longerTermChange / (priceLag2 + 0.0001))) * 0.5;
+                const avgMomentum = (momentum + (longerTermChange / (priceLag2 + 0.0001))) / 2;
+                // Use the stronger signal
+                // Calculate trend using multiple methods
+                const emaTrend = this.emaShort - this.emaLong;
+                const momentumTrend = avgMomentum * 0.5; // Scale momentum for trend
+                const priceChangeTrend = (currentPrice - priceLag2) / (priceLag2 + 0.0001) * 0.3; // Medium-term change
+                const combinedTrend = emaTrend * 0.4 + momentumTrend * 0.4 + priceChangeTrend * 0.2; // Weighted combination
+                
+                    return {
+                    priceLag1: this.normalizePrice(priceLag1),
+                    priceLag2: this.normalizePrice(priceLag2),
+                    priceLag3: this.normalizePrice(priceLag3),
+                    momentum: this.normalizeMomentum(avgMomentum),
+                    volatility: this.normalizeVolatility(this.calculateVolatility(prices)),
+                    trend: this.normalizeTrend(combinedTrend),
+                };
             }
         }
         
         const emaTrend = this.emaShort - this.emaLong;
-        const momentumTrend = effectiveMomentum * 0.5;
+        const momentumTrend = momentum * 0.5;
         const priceChangeTrend = n >= 3 ? (currentPrice - priceLag2) / (priceLag2 + 0.0001) * 0.3 : 0;
         const combinedTrend = emaTrend * 0.4 + momentumTrend * 0.4 + priceChangeTrend * 0.2;
         
@@ -354,64 +324,26 @@ export class AdaptivePricePredictor {
             priceLag1: this.normalizePrice(priceLag1),
             priceLag2: this.normalizePrice(priceLag2),
             priceLag3: this.normalizePrice(priceLag3),
-            momentum: this.normalizeMomentum(effectiveMomentum),
-            volatility: this.normalizeVolatility(this.calculateVolatility(prices, n)),
+            momentum: this.normalizeMomentum(momentum),
+            volatility: this.normalizeVolatility(this.calculateVolatility(prices)),
             trend: this.normalizeTrend(combinedTrend),
         };
     }
     
-    /**
-     * Calculate features at an arbitrary index `k` within the prices array (length >= k).
-     * Mirrors calculateFeatures exactly so learning trains the same feature space.
-     */
-    private calculateFeaturesAt(prices: number[], k: number): {
-        priceLag1: number;
-        priceLag2: number;
-        priceLag3: number;
-        momentum: number;
-        volatility: number;
-        trend: number;
-    } {
-        const currentPrice = prices[k - 1];
-        const priceLag1 = k >= 2 ? prices[k - 2] : currentPrice;
-        const priceLag2 = k >= 3 ? prices[k - 3] : priceLag1;
-        const priceLag3 = k >= 4 ? prices[k - 4] : priceLag2;
-
-        const priceChange = currentPrice - priceLag1;
-        let effectiveMomentum = priceLag1 > 0 ? priceChange / priceLag1 : 0;
-
-        if (k >= 4) {
-            const longerTermChange = currentPrice - priceLag2;
-            if ((priceChange > 0 && longerTermChange > 0) || (priceChange < 0 && longerTermChange < 0)) {
-                effectiveMomentum = (effectiveMomentum + (longerTermChange / (priceLag2 + 0.0001))) * 0.5;
-            }
-        }
-
-        const emaTrend = this.emaShort - this.emaLong;
-        const momentumTrend = effectiveMomentum * 0.5;
-        const priceChangeTrend = k >= 3 ? (currentPrice - priceLag2) / (priceLag2 + 0.0001) * 0.3 : 0;
-        const combinedTrend = emaTrend * 0.4 + momentumTrend * 0.4 + priceChangeTrend * 0.2;
-
-        return {
-            priceLag1: this.normalizePrice(priceLag1),
-            priceLag2: this.normalizePrice(priceLag2),
-            priceLag3: this.normalizePrice(priceLag3),
-            momentum: this.normalizeMomentum(effectiveMomentum),
-            volatility: this.normalizeVolatility(this.calculateVolatility(prices, k)),
-            trend: this.normalizeTrend(combinedTrend),
-        };
-    }
-
-    /** Single-pass mean + variance over the last 5 entries — no slice, no reduce. */
-    private calculateVolatility(prices: number[], n: number): number {
+    private calculateVolatility(prices: number[]): number {
+        const n = prices.length;
         if (n < 3) return 0;
-        const start = n > 5 ? n - 5 : 0;
+        
+        const start = Math.max(0, n - 5);
         const count = n - start;
         let sum = 0;
         for (let i = start; i < n; i++) sum += prices[i];
         const mean = sum / count;
         let variance = 0;
-        for (let i = start; i < n; i++) { const d = prices[i] - mean; variance += d * d; }
+        for (let i = start; i < n; i++) {
+            const d = prices[i] - mean;
+            variance += d * d;
+        }
         return Math.sqrt(variance / count);
     }
     
@@ -433,17 +365,23 @@ export class AdaptivePricePredictor {
     }
     
     /**
-     * Learn from previous prediction using online gradient descent.
-     * Reconstructs the feature vector that *would* have been calculated at time n-1,
-     * so that weight updates correlate to the same features used during prediction.
+     * Learn from previous prediction using online gradient descent
      */
-    private learnFromPreviousPrediction(prices: number[], n: number): void {
-        if (n < 4) return;
+    private learnFromPreviousPrediction(prices: number[]): void {
+        if (prices.length < 4) return;
+        
+        const n = prices.length;
         const actualPrice = prices[n - 1];
         const previousPrice = prices[n - 2];
-
-        // Reconstruct features as calculateFeatures would have seen them at index n-1
-        const prevFeatures = this.calculateFeaturesAt(prices, n - 1);
+        
+        const prevFeatures = {
+            priceLag1: n >= 3 ? this.normalizePrice(prices[n - 3]) : 0.5,
+            priceLag2: n >= 4 ? this.normalizePrice(prices[n - 4]) : 0.5,
+            priceLag3: n >= 5 ? this.normalizePrice(prices[n - 5]) : 0.5,
+            momentum: this.normalizeMomentum((previousPrice - (n >= 3 ? prices[n - 3] : previousPrice)) / (previousPrice + 0.0001)),
+            volatility: 0.1, // Simplified
+            trend: 0, // Simplified
+        };
         
         const predictedPrice = this.predictPrice(prevFeatures);
         const error = actualPrice - predictedPrice;
@@ -483,22 +421,12 @@ export class AdaptivePricePredictor {
             this.correctPredictions++;
         }
         
-        // Track recent predictions with running counters (avoid filter/reduce per call)
+        // Track recent predictions for adaptive confidence adjustment
+        // Get the confidence from the last prediction if available
         const lastConfidence = this.lastPrediction?.confidence || 0.5;
-        const entry = { correct: directionCorrect, confidence: lastConfidence };
-        if (this.recentPredictions.length >= this.recentWindowSize) {
-            const evicted = this.recentPredictions.shift()!;
-            if (evicted.correct) this.recentCorrectCount--;
-            if (evicted.confidence >= 0.80) {
-                this.recentHighConfCount--;
-                if (evicted.correct) this.recentHighConfCorrectCount--;
-            }
-        }
-        this.recentPredictions.push(entry);
-        if (directionCorrect) this.recentCorrectCount++;
-        if (lastConfidence >= 0.80) {
-            this.recentHighConfCount++;
-            if (directionCorrect) this.recentHighConfCorrectCount++;
+        this.recentPredictions.push({ correct: directionCorrect, confidence: lastConfidence });
+        if (this.recentPredictions.length > this.recentWindowSize) {
+            this.recentPredictions.shift(); // Keep only recent window
         }
     }
     
@@ -543,10 +471,11 @@ export class AdaptivePricePredictor {
             ? this.correctPredictions / this.predictionCount 
             : 0.6; // Default to 60% if not enough data
         
-        const recentLen = this.recentPredictions.length;
-        const recentAccuracy = recentLen > 0
-            ? this.recentCorrectCount / recentLen
-            : 0.6;
+        let recentAccuracy = 0.6;
+        if (this.recentPredictions.length > 0) {
+            const recentCorrect = this.recentPredictions.filter(p => p.correct).length;
+            recentAccuracy = recentCorrect / this.recentPredictions.length;
+        }
         
         const accuracyRate = recentAccuracy * 0.6 + overallAccuracy * 0.4;
         
@@ -572,11 +501,16 @@ export class AdaptivePricePredictor {
         );
         
         // Apply overconfidence penalty if recent high-confidence predictions were wrong
-        if (recentLen >= 10 && this.recentHighConfCount >= 5) {
-            const highConfAccuracy = this.recentHighConfCorrectCount / this.recentHighConfCount;
-            if (highConfAccuracy < 0.65) {
-                const overconfidencePenalty = 0.85 - (0.65 - highConfAccuracy) * 0.5;
-                confidence *= Math.max(0.70, overconfidencePenalty);
+        if (this.recentPredictions.length >= 10) {
+            const highConfPredictions = this.recentPredictions.filter(p => p.confidence >= 0.80);
+            if (highConfPredictions.length >= 5) {
+                const highConfAccuracy = highConfPredictions.filter(p => p.correct).length / highConfPredictions.length;
+                // If high confidence predictions have low accuracy, we're overconfident
+                if (highConfAccuracy < 0.65) {
+                    // Reduce confidence more aggressively for overconfident model
+                    const overconfidencePenalty = 0.85 - (0.65 - highConfAccuracy) * 0.5; // Penalty up to 20%
+                    confidence *= Math.max(0.70, overconfidencePenalty);
+                }
             }
         }
         
@@ -624,8 +558,8 @@ export class AdaptivePricePredictor {
         
         // CRITICAL: Prevent overconfidence (confidence = 1.00 is often wrong)
         // Cap maximum confidence based on recent accuracy - MUCH more conservative
-        if (recentLen >= 10) {
-            const recentAccuracy = this.recentCorrectCount / recentLen;
+        if (this.recentPredictions.length >= 10) {
+            const recentAccuracy = this.recentPredictions.filter(p => p.correct).length / this.recentPredictions.length;
             // Very conservative cap: max confidence = 0.60 + (recentAccuracy * 0.30)
             // This ensures confidence never exceeds what recent performance justifies
             const maxConfidence = Math.min(0.92, 0.60 + recentAccuracy * 0.32); // More conservative cap
@@ -743,10 +677,11 @@ export class AdaptivePricePredictor {
         // IMPROVED: More conservative signal generation to reduce false positives
         // Require higher confidence and stronger alignment
         
-        // Running counter instead of filter on every signal
+        // Get recent accuracy for adaptive thresholds
         let recentAccuracy = 0.6;
         if (this.recentPredictions.length >= 10) {
-            recentAccuracy = this.recentCorrectCount / this.recentPredictions.length;
+            const recentCorrect = this.recentPredictions.filter(p => p.correct).length;
+            recentAccuracy = recentCorrect / this.recentPredictions.length;
         }
         
         // Adaptive thresholds: be more selective when accuracy is low, but allow trades at reasonable confidence
@@ -846,17 +781,23 @@ export class AdaptivePricePredictor {
     /**
      * Update price statistics
      */
-    /** Single-pass Welford mean + variance — no reduce, no temporary arrays. */
-    private updateStatistics(prices: number[], n: number): void {
+    private updateStatistics(prices: number[]): void {
+        const n = prices.length;
         if (n === 0) return;
         let sum = 0;
         for (let i = 0; i < n; i++) sum += prices[i];
-        const mean = sum / n;
-        this.priceMean = mean;
-        let v = 0;
-        for (let i = 0; i < n; i++) { const d = prices[i] - mean; v += d * d; }
-        this.priceStd = Math.sqrt(v / n);
-        if (this.priceStd < 0.001) this.priceStd = 0.1;
+        this.priceMean = sum / n;
+        
+        let variance = 0;
+        for (let i = 0; i < n; i++) {
+            const d = prices[i] - this.priceMean;
+            variance += d * d;
+        }
+        this.priceStd = Math.sqrt(variance / n);
+        
+        if (this.priceStd < 0.001) {
+            this.priceStd = 0.1;
+        }
     }
     
     /**
@@ -922,19 +863,18 @@ export class AdaptivePricePredictor {
         this.tsRing.fill(0);
         this.ringLen = 0;
         this.ringHead = 0;
-        this.snapshotBuf.fill(0);
         this.emaShort = 0.5;
         this.emaLong = 0.5;
         this.smoothedPrice = null;
         this.lastAddedPrice = null;
         this.stablePriceCount = 0;
         this.lastStablePrice = null;
-        this.poleHistoryLen = 0;
-        this.poleHistoryHead = 0;
+        this.poleHistory = [];
         this.lastPolePrice = null;
         this.lastPoleType = null;
         this.lastPoleTimestamp = null;
         this.lastPrediction = null;
+        // Keep weights (they represent learned knowledge)
     }
 }
 
